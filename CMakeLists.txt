@@ -1,47 +1,73 @@
 cmake_minimum_required(VERSION 3.10)
-project(nyse_xdp_parser)
+project(NYSE_XDP_Parser VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Build configuration
+set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type: Debug or Release")
+set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release)
 
 # Find required libraries
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(LIBPCAP REQUIRED libpcap)
+# Try pkg-config first, fall back to find_library
+find_package(PkgConfig)
+if(PKG_CONFIG_FOUND)
+  pkg_check_modules(LIBPCAP libpcap)
+endif()
+
+# Fallback to find_library if pkg-config didn't work
+if(NOT LIBPCAP_FOUND)
+  find_library(PCAP_LIBRARY pcap)
+  if(PCAP_LIBRARY)
+    set(LIBPCAP_LIBRARIES ${PCAP_LIBRARY})
+    set(LIBPCAP_FOUND TRUE)
+    # Try to find include directory
+    find_path(PCAP_INCLUDE_DIR pcap.h
+      PATHS
+        /usr/include
+        /usr/local/include
+        /opt/homebrew/include
+    )
+    if(PCAP_INCLUDE_DIR)
+      set(LIBPCAP_INCLUDE_DIRS ${PCAP_INCLUDE_DIR})
+    endif()
+  endif()
+endif()
+
+if(NOT LIBPCAP_FOUND)
+  message(FATAL_ERROR "libpcap library not found. Please install libpcap-dev (Linux) or libpcap (macOS)")
+endif()
 
 # Main parser executable
-add_executable(xdp_parser
+add_executable(reader
     reader.cpp
 )
 
-target_include_directories(xdp_parser PRIVATE
+target_include_directories(reader PRIVATE
     ${LIBPCAP_INCLUDE_DIRS}
 )
 
-target_link_libraries(xdp_parser
+target_link_libraries(reader
     ${LIBPCAP_LIBRARIES}
 )
 
-# Test utilities
-add_executable(test_symbol_lookup
-    test_symbol_lookup.cpp
+# Compiler flags
+target_compile_options(reader PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
 )
 
-add_executable(extract_symbols
-    extract_symbols.cpp
-)
+# Debug flags
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0")
+# Release flags
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
 
-target_link_libraries(extract_symbols
-    ${LIBPCAP_LIBRARIES}
-)
+# Generate compile_commands.json for clangd/clang-tidy
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Install targets
-install(TARGETS xdp_parser
+install(TARGETS reader
     RUNTIME DESTINATION bin
 )
-
-# Add debug flags for debug builds
-set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -Wall -Wextra -pedantic")
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3")
-
-# Generate compile_commands.json for clang-tidy
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)

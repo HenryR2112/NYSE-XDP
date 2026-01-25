@@ -1,1 +1,24 @@
-data
+# Ignore data and build artifacts
+data/
+*.exe
+*.o
+*.obj
+*.out
+*.log
+*.a
+*.so
+*.dll
+*.dSYM/
+build/
+cmake-build*/
+*.vcxproj*
+.vscode/
+*.swp
+# clangd/compile_commands.json, etc.
+compile_commands.json
+
+# Ignore macOS, Windows, and Linux system files
+.DS_Store
+Thumbs.db
+# End of Selection
+```
