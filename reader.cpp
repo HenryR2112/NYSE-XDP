@@ -40,8 +40,9 @@ struct XdpMessageHeader {
 #pragma pack(pop)
 
 // Configuration
-int verbose_mode = 0;           // 0 = simplified, 1 = verbose
-std::string filter_ticker = ""; // Empty string means no filter
+int verbose_mode = 0;            // 0 = simplified, 1 = verbose
+std::string filter_ticker = "";  // Empty string means no filter
+std::string filter_message = ""; // Empty string means no filter
 std::unordered_map<uint32_t, std::string> symbol_map;
 std::unordered_map<uint32_t, uint32_t> symbol_msg_counters;
 
@@ -309,259 +310,390 @@ void parse_xdp_message_simple(const uint8_t *data, size_t max_len,
   if (msg_size < 4 || msg_size > max_len)
     return;
 
-  // Parse message-specific fields
-  // Messages with common header (SourceTimeNS, SymbolIndex, SymbolSeqNum at
-  // offset 4, 8, 12)
-  if (msg_size >= 16) {
-    uint32_t source_time_ns = read_le32(data + 4);
-    uint32_t symbol_index = read_le32(data + 8);
-    uint32_t symbol_seq = read_le32(data + 12);
-    std::string ticker = get_symbol(symbol_index);
+  // Declare variables for use in switch statement
+  std::string ticker;
+  uint32_t msg_num = 0;
 
-    // Filter by ticker if specified (for messages with symbol_index)
-    if (!filter_ticker.empty() && ticker != filter_ticker) {
+  // Handle messages with non-standard header structure first
+  if (msg_type == 106 || msg_type == 223) {
+    // Messages 106 and 223: SourceTime@4, SourceTimeNS@8, SymbolIndex@12
+    if (msg_size >= 12) {
+      uint32_t source_time = read_le32(data + 4);    // Offset 4, 4 bytes
+      uint32_t source_time_ns = read_le32(data + 8); // Offset 8, 4 bytes
+      uint32_t symbol_index = read_le32(data + 12);  // Offset 12, 4 bytes
+      ticker = get_symbol(symbol_index);
+
+      // Filter by ticker if specified
+      if (!filter_ticker.empty() && ticker != filter_ticker) {
+        return;
+      }
+
+      // message filter
+      if (!filter_message.empty() &&
+          filter_message != get_message_type_name(msg_type)) {
+        return;
+      }
+
+      // Output timestamp and message type (after filter check)
+      std::cout << format_time_micro(source_time, source_time_ns) << " ";
+      std::cout << get_message_type_name(msg_type) << " ";
+
+      msg_num = ++symbol_msg_counters[symbol_index];
+    } else {
+      return; // Too short
+    }
+  } else {
+    // Standard messages with common header (SourceTimeNS, SymbolIndex,
+    // SymbolSeqNum at offset 4, 8, 12)
+    if (msg_size >= 16) {
+      uint32_t source_time_ns = read_le32(data + 4);
+      uint32_t symbol_index = read_le32(data + 8);
+      uint32_t symbol_seq = read_le32(data + 12);
+      ticker = get_symbol(symbol_index);
+
+      // Filter by ticker if specified (for messages with symbol_index)
+      if (!filter_ticker.empty() && ticker != filter_ticker) {
+        return;
+      }
+
+      // message filter
+      if (!filter_message.empty() &&
+          filter_message != get_message_type_name(msg_type)) {
+        return;
+      };
+
+      // Output timestamp and message type (after filter check)
+      std::cout << format_time_micro(packet_send_time, packet_send_time_ns)
+                << " ";
+      std::cout << get_message_type_name(msg_type) << " ";
+
+      msg_num = ++symbol_msg_counters[symbol_index];
+    } else {
+      // Messages without common header - skip (integrated feed messages should
+      // have common header)
       return;
     }
+  }
 
-    // Output timestamp and message type (after filter check)
-    std::cout << format_time_micro(packet_send_time, packet_send_time_ns)
-              << " ";
-    std::cout << get_message_type_name(msg_type) << " ";
+  // Parse message-specific fields
+  switch (msg_type) {
+  case 100: { // Add Order (39 bytes)
+    // Spec: OrderID@16(8), Price@24(4), Volume@28(4), Side@32(1),
+    // FirmID@33(5), NumParitySplits@38(1)
+    std::cout << ticker << " " << msg_num;
+    if (msg_size >= 39) {
+      uint64_t order_id = read_le64(data + 16); // Offset 16, 8 bytes
+      uint32_t price = read_le32(data + 24);    // Offset 24, 4 bytes
+      uint32_t volume = read_le32(data + 28);   // Offset 28, 4 bytes
+      uint8_t side = data[32];                  // Offset 32, 1 byte
+      std::cout << " OrderID=" << order_id;
+      std::cout << " $" << std::fixed << std::setprecision(4)
+                << parse_price(price);
+      std::cout << " " << volume;
+      std::cout << " " << get_side_abbr(side);
+    }
+    break;
+  }
 
-    uint32_t msg_num = ++symbol_msg_counters[symbol_index];
+  case 101: { // Modify Order (35 bytes)
+    // Spec: OrderID@16(8), Price@24(4), Volume@28(4), PositionChange@32(1),
+    // PrevPriceParitySplits@33(1), NewPriceParitySplits@34(1)
+    std::cout << ticker << " " << msg_num;
+    if (msg_size >= 35) {
+      uint64_t order_id = read_le64(data + 16); // Offset 16, 8 bytes
+      uint32_t price = read_le32(data + 24);    // Offset 24, 4 bytes
+      uint32_t volume = read_le32(data + 28);   // Offset 28, 4 bytes
+      uint8_t position_change = data[32];       // Offset 32, 1 byte
+      std::cout << " OrderID=" << order_id;
+      std::cout << " $" << std::fixed << std::setprecision(4)
+                << parse_price(price);
+      std::cout << " " << volume;
+      std::cout << " Pos=" << (position_change == 0 ? "Kept" : "Lost");
+    } else {
+      std::cout << " [truncated, size=" << msg_size << "]";
+    }
+    break;
+  }
 
-    switch (msg_type) {
-    case 100: { // Add Order (39 bytes)
-      std::cout << ticker << " " << msg_num;
-      if (msg_size >= 39) {
-        uint64_t order_id = read_le64(data + 16);
+  case 102: { // Delete Order (25 bytes)
+    std::cout << ticker << " " << msg_num;
+    if (msg_size >= 25) {
+      uint64_t order_id = read_le64(data + 16);
+      std::cout << " OrderID=" << order_id;
+    }
+    break;
+  }
+
+  case 103: { // Execute Order (42 bytes)
+    // Spec: OrderID@16(8), TradeID@24(4), Price@28(4), Volume@32(4),
+    //       PrintableFlag@36(1), NumParitySplits@37(1), DBExecID@38(4)
+    // Note: Volume is the executed quantity for THIS execution (not
+    // cumulative)
+    std::cout << ticker << " " << msg_num;
+    if (msg_size >= 42) {
+      uint64_t order_id = read_le64(data + 16); // Offset 16, 8 bytes
+      uint32_t trade_id = read_le32(data + 24); // Offset 24, 4 bytes
+      uint32_t price = read_le32(data + 28);    // Offset 28, 4 bytes
+      uint32_t volume =
+          read_le32(data + 32); // Offset 32, 4 bytes (Executed quantity)
+      uint8_t printable_flag = data[36]; // Offset 36, 1 byte
+      // NumParitySplits@37(1) and DBExecID@38(4) - not displayed in simple
+      // mode
+
+      std::cout << " OrderID=" << order_id;
+      std::cout << " TradeID=" << trade_id;
+      std::cout << " $" << std::fixed << std::setprecision(4)
+                << parse_price(price);
+      std::cout << " Qty=" << volume;
+      if (printable_flag == 0) {
+        std::cout << " (NotPrinted)";
+      }
+    } else if (msg_size >= 32) {
+      // Fallback for truncated messages
+      uint64_t order_id = read_le64(data + 16);
+      uint32_t trade_id = read_le32(data + 24);
+      uint32_t price = read_le32(data + 28);
+      std::cout << " OrderID=" << order_id;
+      std::cout << " TradeID=" << trade_id;
+      std::cout << " $" << std::fixed << std::setprecision(4)
+                << parse_price(price);
+      std::cout << " [truncated, size=" << msg_size << "]";
+    }
+    break;
+  }
+
+  case 104: { // Replace Order (42 bytes)
+    // Spec: OrderID@16(8), NewOrderID@24(8), Price@32(4), Volume@36(4),
+    // PrevPriceParitySplits@40(1), NewPriceParitySplits@41(1)
+    std::cout << ticker << " " << msg_num;
+    if (msg_size >= 42) {
+      uint64_t order_id = read_le64(data + 16);     // Offset 16, 8 bytes
+      uint64_t new_order_id = read_le64(data + 24); // Offset 24, 8 bytes
+      uint32_t price = read_le32(data + 32);        // Offset 32, 4 bytes
+      uint32_t volume = read_le32(data + 36);       // Offset 36, 4 bytes
+      uint8_t prev_price_parity_splits = data[40];  // Offset 40, 1 byte
+      uint8_t new_price_parity_splits = data[41];   // Offset 41, 1 byte
+      std::cout << " OldOrderID=" << order_id;
+      std::cout << " NewOrderID=" << new_order_id;
+      std::cout << " $" << std::fixed << std::setprecision(4)
+                << parse_price(price);
+      std::cout << " " << volume;
+    }
+    break;
+  }
+
+  case 105: { // Imbalance Message (73 bytes)
+    // Spec: ReferencePrice@16(4), PairedQty@20(4), ImbalanceQty@24(4),
+    // ImbalanceSide@28(1), ContinuousBookClearingPrice@29(4),
+    // AuctionOnlyClearingPrice@33(4), SSR Filing@37(1),
+    // IndicativeMatchPrice@38(4),
+    // ... (fields between 38-71), UnpairedSide@71(1),
+    // SignificantImbalance@72(1)
+    std::cout << ticker << " " << msg_num;
+    if (msg_size >= 73) {
+      uint32_t reference_price = read_le32(data + 16); // Offset 16, 4 bytes
+      uint32_t paired_qty = read_le32(data + 20);      // Offset 20, 4 bytes
+      uint32_t imbalance_qty = read_le32(data + 24);   // Offset 24, 4 bytes
+      uint8_t imbalance_side = data[28];               // Offset 28, 1 byte
+      uint32_t continuous_book_clearing_price =
+          read_le32(data + 29); // Offset 29, 4 bytes
+      uint32_t closing_only_clearing_price = read_le32(
+          data + 33); // Offset 33, 4 bytes (Auction Only Clearing Price)
+      uint8_t ssr_filing_price = data[37]; // Offset 37, 1 byte
+      uint32_t indicative_match_price =
+          read_le32(data + 38);                 // Offset 38, 4 bytes
+      uint8_t unpaired_side = data[71];         // Offset 71, 1 byte (ASCII)
+      uint8_t significant_imbalance = data[72]; // Offset 72, 1 byte (ASCII)
+      std::cout << " RefPrice=$" << std::fixed << std::setprecision(4)
+                << parse_price(reference_price);
+      std::cout << " Paired=" << paired_qty;
+      std::cout << " Imbalance=" << imbalance_qty;
+      std::cout << " Side=" << (char)imbalance_side;
+      std::cout << " IndicativeMatch=$" << parse_price(indicative_match_price);
+      if (unpaired_side != ' ') {
+        std::cout << " UnpairedSide=" << (char)unpaired_side;
+      }
+      if (significant_imbalance == 'Y') {
+        std::cout << " SignificantImbalance=Y";
+      }
+    } else if (msg_size >= 60) {
+      // Fallback for older/truncated messages
+      uint32_t reference_price = read_le32(data + 16);
+      uint32_t paired_qty = read_le32(data + 20);
+      uint32_t imbalance_qty = read_le32(data + 24);
+      uint8_t imbalance_side = data[28];
+      uint32_t indicative_match_price = read_le32(data + 38);
+      std::cout << " RefPrice=$" << std::fixed << std::setprecision(4)
+                << parse_price(reference_price);
+      std::cout << " Paired=" << paired_qty;
+      std::cout << " Imbalance=" << imbalance_qty;
+      std::cout << " Side=" << (char)imbalance_side;
+      std::cout << " IndicativeMatch=$" << parse_price(indicative_match_price);
+      std::cout << " [truncated, size=" << msg_size << "]";
+    }
+    break;
+  }
+
+  case 106: { // Add Order Refresh (43 bytes)
+    // Spec: SourceTime@4(4), SourceTimeNS@8(4), SymbolIndex@12(4),
+    // SymbolSeqNum@16(4),
+    //       OrderID@20(8), Price@28(4), Volume@32(4), Side@36(1), FirmID@37(5),
+    //       NumParitySplits@42(1)
+    // Note: Different header structure - uses SourceTime instead of
+    // SourceTimeNS only
+    std::cout << ticker << " " << msg_num;
+    if (msg_size >= 43) {
+      uint32_t source_time = read_le32(data + 4);    // Offset 4, 4 bytes
+      uint32_t source_time_ns = read_le32(data + 8); // Offset 8, 4 bytes
+      uint32_t symbol_index = read_le32(data + 12);  // Offset 12, 4 bytes
+      uint32_t symbol_seq = read_le32(data + 16);    // Offset 16, 4 bytes
+      uint64_t order_id = read_le64(data + 20);      // Offset 20, 8 bytes
+      uint32_t price = read_le32(data + 28);         // Offset 28, 4 bytes
+      uint32_t volume = read_le32(data + 32);        // Offset 32, 4 bytes
+      uint8_t side = data[36];                       // Offset 36, 1 byte
+      // FirmID@37(5) and NumParitySplits@42(1) - not displayed in simple mode
+      std::cout << " OrderID=" << order_id;
+      std::cout << " $" << std::fixed << std::setprecision(4)
+                << parse_price(price);
+      std::cout << " " << volume;
+      std::cout << " " << get_side_abbr(side);
+    } else if (msg_size >= 20) {
+      // Fallback for truncated messages
+      uint64_t order_id = read_le64(data + 20);
+      std::cout << " OrderID=" << order_id;
+      std::cout << " [truncated, size=" << msg_size << "]";
+    }
+    break;
+  }
+
+  case 110: { // Non-Displayed Trade (32 bytes)
+    std::cout << ticker << " " << msg_num;
+    if (msg_size >= 32) {
+      uint64_t trade_id = read_le64(data + 16);
+      uint32_t price = read_le32(data + 24);
+      uint32_t volume = read_le32(data + 28);
+      std::cout << " TradeID=" << trade_id;
+      std::cout << " $" << std::fixed << std::setprecision(4)
+                << parse_price(price);
+      std::cout << " Qty=" << volume;
+    }
+    break;
+  }
+
+  case 111: { // Cross Trade (40 bytes)
+    std::cout << ticker << " " << msg_num;
+    if (msg_size >= 25) {
+      uint64_t cross_id = read_le64(data + 16);
+      std::cout << " CrossID=" << cross_id;
+      if (msg_size >= 29) {
         uint32_t price = read_le32(data + 24);
-        uint32_t volume = read_le32(data + 28);
-        uint8_t side = data[32];
-        std::cout << " OrderID=" << order_id;
         std::cout << " $" << std::fixed << std::setprecision(4)
                   << parse_price(price);
-        std::cout << " " << volume;
-        std::cout << " " << get_side_abbr(side);
-      }
-      break;
-    }
-
-    case 101: { // Modify Order (35 bytes)
-      std::cout << ticker << " " << msg_num;
-      if (msg_size >= 35) {
-        uint64_t order_id = read_le64(data + 16);
-        uint32_t price = read_le32(data + 24);
-        uint32_t volume = read_le32(data + 28);
-        uint8_t position_change = data[32];
-        std::cout << " OrderID=" << order_id;
-        std::cout << " $" << std::fixed << std::setprecision(4)
-                  << parse_price(price);
-        std::cout << " " << volume;
-        std::cout << " Pos=" << (position_change == 0 ? "Kept" : "Lost");
-      } else {
-        std::cout << " [truncated, size=" << msg_size << "]";
-      }
-      break;
-    }
-
-    case 102: { // Delete Order (25 bytes)
-      std::cout << ticker << " " << msg_num;
-      if (msg_size >= 25) {
-        uint64_t order_id = read_le64(data + 16);
-        std::cout << " OrderID=" << order_id;
-      }
-      break;
-    }
-
-    case 103: { // Execute Order (32 bytes)
-      std::cout << ticker << " " << msg_num;
-      if (msg_size >= 32) {
-        uint64_t order_id = read_le64(data + 16);
-        uint32_t exec_volume = read_le32(data + 24);
-        uint32_t price = read_le32(data + 28);
-        std::cout << " OrderID=" << order_id;
-        std::cout << " $" << std::fixed << std::setprecision(4)
-                  << parse_price(price);
-        std::cout << " Qty=" << exec_volume;
-      }
-      break;
-    }
-
-    case 104: { // Replace Order (42 bytes)
-      std::cout << ticker << " " << msg_num;
-      if (msg_size >= 42) {
-        uint64_t order_id = read_le64(data + 16);
-        uint64_t new_order_id = read_le64(data + 24);
-        uint32_t price = read_le32(data + 32);
-        uint32_t volume = read_le32(data + 36);
-        uint8_t prev_price_parity_splits = data[40];
-        uint8_t new_price_parity_splits = data[41];
-        std::cout << " OldOrderID=" << order_id;
-        std::cout << " NewOrderID=" << new_order_id;
-        std::cout << " $" << std::fixed << std::setprecision(4)
-                  << parse_price(price);
-        std::cout << " " << volume;
-      }
-      break;
-    }
-
-    case 105: { // Imbalance Message
-      std::cout << ticker << " " << msg_num;
-      if (msg_size >= 60) {
-        uint32_t reference_price = read_le32(data + 16);
-        uint32_t paired_qty = read_le32(data + 20);
-        uint32_t imbalance_qty = read_le32(data + 24);
-        uint8_t imbalance_side = data[28];
-        uint32_t continuous_book_clearing_price = read_le32(data + 29);
-        uint32_t closing_only_clearing_price = read_le32(data + 33);
-        uint8_t ssr_filing_price = data[37];
-        uint32_t indicative_match_price = read_le32(data + 38);
-        std::cout << " RefPrice=$" << std::fixed << std::setprecision(4)
-                  << parse_price(reference_price);
-        std::cout << " Paired=" << paired_qty;
-        std::cout << " Imbalance=" << imbalance_qty;
-        std::cout << " Side=" << (char)imbalance_side;
-        std::cout << " IndicativeMatch=$"
-                  << parse_price(indicative_match_price);
-      }
-      break;
-    }
-
-    case 106: { // Add Order Refresh (39 bytes)
-      std::cout << ticker << " " << msg_num;
-      if (msg_size >= 39) {
-        uint64_t order_id = read_le64(data + 16);
-        uint32_t price = read_le32(data + 24);
-        uint32_t volume = read_le32(data + 28);
-        uint8_t side = data[32];
-        std::cout << " OrderID=" << order_id;
-        std::cout << " $" << std::fixed << std::setprecision(4)
-                  << parse_price(price);
-        std::cout << " " << volume;
-        std::cout << " " << get_side_abbr(side);
-      }
-      break;
-    }
-
-    case 110: { // Non-Displayed Trade (32 bytes)
-      std::cout << ticker << " " << msg_num;
-      if (msg_size >= 32) {
-        uint64_t trade_id = read_le64(data + 16);
-        uint32_t price = read_le32(data + 24);
-        uint32_t volume = read_le32(data + 28);
-        std::cout << " TradeID=" << trade_id;
-        std::cout << " $" << std::fixed << std::setprecision(4)
-                  << parse_price(price);
-        std::cout << " Qty=" << volume;
-      }
-      break;
-    }
-
-    case 111: { // Cross Trade (40 bytes)
-      std::cout << ticker << " " << msg_num;
-      if (msg_size >= 25) {
-        uint64_t cross_id = read_le64(data + 16);
-        std::cout << " CrossID=" << cross_id;
-        if (msg_size >= 29) {
-          uint32_t price = read_le32(data + 24);
-          std::cout << " $" << std::fixed << std::setprecision(4)
-                    << parse_price(price);
-          if (msg_size >= 33) {
-            uint32_t volume = read_le32(data + 28);
-            std::cout << " Qty=" << volume;
-            if (msg_size >= 37) {
-              uint32_t cross_type = read_le32(data + 32);
-              std::cout << " Type=" << cross_type;
-            }
+        if (msg_size >= 33) {
+          uint32_t volume = read_le32(data + 28);
+          std::cout << " Qty=" << volume;
+          if (msg_size >= 37) {
+            uint32_t cross_type = read_le32(data + 32);
+            std::cout << " Type=" << cross_type;
           }
         }
-      } else {
-        std::cout << " [truncated, size=" << msg_size << "]";
       }
-      break;
+    } else {
+      std::cout << " [truncated, size=" << msg_size << "]";
     }
-
-    case 112: { // Trade Cancel (32 bytes)
-      std::cout << ticker << " " << msg_num;
-      if (msg_size >= 32) {
-        uint64_t trade_id = read_le64(data + 16);
-        uint32_t price = read_le32(data + 24);
-        uint32_t volume = read_le32(data + 28);
-        std::cout << " TradeID=" << trade_id;
-        std::cout << " $" << std::fixed << std::setprecision(4)
-                  << parse_price(price);
-        std::cout << " Qty=" << volume;
-      }
-      break;
-    }
-
-    case 113: { // Cross Correction (40 bytes)
-      std::cout << ticker << " " << msg_num;
-      if (msg_size >= 40) {
-        uint64_t cross_id = read_le64(data + 16);
-        uint32_t price = read_le32(data + 24);
-        uint32_t volume = read_le32(data + 28);
-        uint32_t cross_type = read_le32(data + 32);
-        std::cout << " CrossID=" << cross_id;
-        std::cout << " $" << std::fixed << std::setprecision(4)
-                  << parse_price(price);
-        std::cout << " Qty=" << volume;
-        std::cout << " Type=" << cross_type;
-      }
-      break;
-    }
-
-    case 114: { // Retail Price Improvement (17 bytes)
-      std::cout << ticker << " " << msg_num;
-      if (msg_size >= 17) {
-        uint8_t rpi_indicator = data[16];
-        std::cout << " RPI=";
-        if (rpi_indicator == ' ') {
-          std::cout << "None";
-        } else if (rpi_indicator == 'A') {
-          std::cout << "Bid";
-        } else if (rpi_indicator == 'B') {
-          std::cout << "Offer";
-        } else if (rpi_indicator == 'C') {
-          std::cout << "Both";
-        } else {
-          std::cout << "'" << (char)rpi_indicator << "'";
-        }
-      } else {
-        std::cout << " [truncated, size=" << msg_size << "]";
-      }
-      break;
-    }
-
-    case 223: { // Stock Summary
-      std::cout << ticker << " " << msg_num;
-      if (msg_size >= 40) {
-        uint32_t high_price = read_le32(data + 16);
-        uint32_t low_price = read_le32(data + 20);
-        uint32_t open_price = read_le32(data + 24);
-        uint32_t close_price = read_le32(data + 28);
-        uint64_t total_volume = read_le64(data + 32);
-        std::cout << " High=$" << std::fixed << std::setprecision(4)
-                  << parse_price(high_price);
-        std::cout << " Low=$" << parse_price(low_price);
-        std::cout << " Open=$" << parse_price(open_price);
-        std::cout << " Close=$" << parse_price(close_price);
-        std::cout << " Volume=" << total_volume;
-      }
-      break;
-    }
-
-    default:
-      std::cout << ticker << " Type=" << msg_type << " Size=" << msg_size;
-      break;
-    }
-    std::cout << std::endl;
-  } else {
-    // Messages without common header - skip (integrated feed messages should
-    // have common header)
-    return;
+    break;
   }
+
+  case 112: { // Trade Cancel (32 bytes)
+    std::cout << ticker << " " << msg_num;
+    if (msg_size >= 32) {
+      uint64_t trade_id = read_le64(data + 16);
+      uint32_t price = read_le32(data + 24);
+      uint32_t volume = read_le32(data + 28);
+      std::cout << " TradeID=" << trade_id;
+      std::cout << " $" << std::fixed << std::setprecision(4)
+                << parse_price(price);
+      std::cout << " Qty=" << volume;
+    }
+    break;
+  }
+
+  case 113: { // Cross Correction (40 bytes)
+    std::cout << ticker << " " << msg_num;
+    if (msg_size >= 40) {
+      uint64_t cross_id = read_le64(data + 16);
+      uint32_t price = read_le32(data + 24);
+      uint32_t volume = read_le32(data + 28);
+      uint32_t cross_type = read_le32(data + 32);
+      std::cout << " CrossID=" << cross_id;
+      std::cout << " $" << std::fixed << std::setprecision(4)
+                << parse_price(price);
+      std::cout << " Qty=" << volume;
+      std::cout << " Type=" << cross_type;
+    }
+    break;
+  }
+
+  case 114: { // Retail Price Improvement (17 bytes)
+    // Spec: RPIIndicator@16(1) - ' '=None, 'A'=Bid, 'B'=Offer, 'C'=Both
+    std::cout << ticker << " " << msg_num;
+    if (msg_size >= 17) {
+      uint8_t rpi_indicator = data[16]; // Offset 16, 1 byte (ASCII)
+      std::cout << " RPI=";
+      if (rpi_indicator == ' ') {
+        std::cout << "None";
+      } else if (rpi_indicator == 'A') {
+        std::cout << "Bid";
+      } else if (rpi_indicator == 'B') {
+        std::cout << "Offer";
+      } else if (rpi_indicator == 'C') {
+        std::cout << "Both";
+      } else {
+        std::cout << "'" << (char)rpi_indicator << "'";
+      }
+    } else {
+      std::cout << " [truncated, size=" << msg_size << "]";
+    }
+    break;
+  }
+
+  case 223: { // Stock Summary (36 bytes)
+    // Spec: SourceTime@4(4), SourceTimeNS@8(4), SymbolIndex@12(4),
+    //       HighPrice@16(4), LowPrice@20(4), Open@24(4), Close@28(4),
+    //       TotalVolume@32(4)
+    // Note: Different header structure and TotalVolume is 4 bytes, not 8
+    std::cout << ticker << " " << msg_num;
+    if (msg_size >= 36) {
+      uint32_t source_time = read_le32(data + 4);    // Offset 4, 4 bytes
+      uint32_t source_time_ns = read_le32(data + 8); // Offset 8, 4 bytes
+      uint32_t symbol_index = read_le32(data + 12);  // Offset 12, 4 bytes
+      uint32_t high_price = read_le32(data + 16);    // Offset 16, 4 bytes
+      uint32_t low_price = read_le32(data + 20);     // Offset 20, 4 bytes
+      uint32_t open_price = read_le32(data + 24);    // Offset 24, 4 bytes
+      uint32_t close_price = read_le32(data + 28);   // Offset 28, 4 bytes
+      uint32_t total_volume =
+          read_le32(data + 32); // Offset 32, 4 bytes (not 8!)
+      std::cout << " High=$" << std::fixed << std::setprecision(4)
+                << parse_price(high_price);
+      std::cout << " Low=$" << parse_price(low_price);
+      std::cout << " Open=$" << parse_price(open_price);
+      std::cout << " Close=$" << parse_price(close_price);
+      std::cout << " Volume=" << total_volume;
+    } else if (msg_size >= 16) {
+      // Fallback for truncated messages
+      uint32_t high_price = read_le32(data + 16);
+      std::cout << " High=$" << std::fixed << std::setprecision(4)
+                << parse_price(high_price);
+      std::cout << " [truncated, size=" << msg_size << "]";
+    }
+    break;
+  }
+
+  default:
+    std::cout << ticker << " Type=" << msg_type << " Size=" << msg_size;
+    break;
+  }
+  std::cout << std::endl;
 }
 
 std::string get_ticker(uint32_t index) {
@@ -596,43 +728,98 @@ void parse_xdp_message_verbose(const uint8_t *data, size_t max_len,
     return;
   }
 
-  // Parse common fields
-  if (msg_size >= 16) {
-    uint32_t source_time_ns = read_le32(data + 4);
-    uint32_t symbol_index = read_le32(data + 8);
-    uint32_t symbol_seq = read_le32(data + 12);
+  // Handle messages with non-standard header structure first
+  if (msg_type == 106 || msg_type == 223) {
+    // Messages 106 and 223: SourceTime@4, SourceTimeNS@8, SymbolIndex@12
+    if (msg_size >= 12) {
+      uint32_t source_time = read_le32(data + 4);    // Offset 4, 4 bytes
+      uint32_t source_time_ns = read_le32(data + 8); // Offset 8, 4 bytes
+      uint32_t symbol_index = read_le32(data + 12);  // Offset 12, 4 bytes
 
-    // Get ticker symbol
-    std::string ticker = get_symbol(symbol_index);
+      // Get ticker symbol
+      std::string ticker = get_symbol(symbol_index);
 
-    // Filter by ticker if specified
-    if (!filter_ticker.empty() && ticker != filter_ticker) {
-      return;
+      // Filter by ticker if specified
+      if (!filter_ticker.empty() && ticker != filter_ticker) {
+        return;
+      }
+
+      if (!filter_message.empty() &&
+          filter_message != get_message_type_name(msg_type)) {
+        return;
+      };
+
+      std::cout << "      SourceTime: " << source_time << " seconds"
+                << std::endl;
+      std::cout << "      SourceTimeNS: " << source_time_ns << std::endl;
+      std::cout << "      SymbolIndex: " << symbol_index;
+
+      // Show ticker symbol if available
+      auto it = symbol_map.find(symbol_index);
+      if (it != symbol_map.end()) {
+        std::cout << " (" << it->second << ")";
+      }
+      std::cout << std::endl;
+
+      if (msg_type == 106) {
+        // Message 106 also has SymbolSeqNum at offset 16
+        if (msg_size >= 16) {
+          uint32_t symbol_seq = read_le32(data + 16);
+          std::cout << "      SymbolSeqNum: " << symbol_seq << std::endl;
+        }
+      }
+    } else {
+      return; // Too short
     }
+  } else {
+    // Standard messages with common header (SourceTimeNS, SymbolIndex,
+    // SymbolSeqNum at offset 4, 8, 12)
+    if (msg_size >= 16) {
+      uint32_t source_time_ns = read_le32(data + 4);
+      uint32_t symbol_index = read_le32(data + 8);
+      uint32_t symbol_seq = read_le32(data + 12);
 
-    std::cout << "      SourceTimeNS: " << source_time_ns << std::endl;
-    std::cout << "      SymbolIndex: " << symbol_index;
+      // Get ticker symbol
+      std::string ticker = get_symbol(symbol_index);
 
-    // Show ticker symbol if available
-    auto it = symbol_map.find(symbol_index);
-    if (it != symbol_map.end()) {
-      std::cout << " (" << it->second << ")";
+      // Filter by ticker if specified
+      if (!filter_ticker.empty() && ticker != filter_ticker) {
+        return;
+      }
+
+      if (!filter_message.empty() &&
+          filter_message != get_message_type_name(msg_type)) {
+        return;
+      };
+
+      std::cout << "      SourceTimeNS: " << source_time_ns << std::endl;
+      std::cout << "      SymbolIndex: " << symbol_index;
+
+      // Show ticker symbol if available
+      auto it = symbol_map.find(symbol_index);
+      if (it != symbol_map.end()) {
+        std::cout << " (" << it->second << ")";
+      }
+      std::cout << std::endl;
+
+      std::cout << "      SymbolSeqNum: " << symbol_seq << std::endl;
+    } else {
+      return; // Too short
     }
-    std::cout << std::endl;
-
-    std::cout << "      SymbolSeqNum: " << symbol_seq << std::endl;
   }
 
   // Parse message-specific fields
   switch (msg_type) {
   case 100: { // Add Order (39 bytes)
+    // Spec: OrderID@16(8), Price@24(4), Volume@28(4), Side@32(1), FirmID@33(5),
+    // NumParitySplits@38(1)
     if (msg_size >= 39) {
-      uint64_t order_id = read_le64(data + 16);
-      uint32_t price = read_le32(data + 24);
-      uint32_t volume = read_le32(data + 28);
-      uint8_t side = data[32];
+      uint64_t order_id = read_le64(data + 16); // Offset 16, 8 bytes
+      uint32_t price = read_le32(data + 24);    // Offset 24, 4 bytes
+      uint32_t volume = read_le32(data + 28);   // Offset 28, 4 bytes
+      uint8_t side = data[32];                  // Offset 32, 1 byte
       char firm_id[6] = {0};
-      memcpy(firm_id, data + 33, 5);
+      memcpy(firm_id, data + 33, 5); // Offset 33, 5 bytes
 
       std::cout << "      OrderID: " << order_id << std::endl;
       std::cout << "      Price: $" << std::fixed << std::setprecision(4)
@@ -646,13 +833,15 @@ void parse_xdp_message_verbose(const uint8_t *data, size_t max_len,
   }
 
   case 101: { // Modify Order (35 bytes)
+    // Spec: OrderID@16(8), Price@24(4), Volume@28(4), PositionChange@32(1),
+    // PrevPriceParitySplits@33(1), NewPriceParitySplits@34(1)
     if (msg_size >= 35) {
-      uint64_t order_id = read_le64(data + 16);
-      uint32_t price = read_le32(data + 24);
-      uint32_t volume = read_le32(data + 28);
-      uint8_t position_change = data[32];
-      uint8_t prev_price_parity_splits = data[33];
-      uint8_t new_price_parity_splits = data[34];
+      uint64_t order_id = read_le64(data + 16);    // Offset 16, 8 bytes
+      uint32_t price = read_le32(data + 24);       // Offset 24, 4 bytes
+      uint32_t volume = read_le32(data + 28);      // Offset 28, 4 bytes
+      uint8_t position_change = data[32];          // Offset 32, 1 byte
+      uint8_t prev_price_parity_splits = data[33]; // Offset 33, 1 byte
+      uint8_t new_price_parity_splits = data[34];  // Offset 34, 1 byte
 
       std::cout << "      OrderID: " << order_id << std::endl;
       std::cout << "      Price: $" << std::fixed << std::setprecision(4)
@@ -677,28 +866,59 @@ void parse_xdp_message_verbose(const uint8_t *data, size_t max_len,
     break;
   }
 
-  case 103: { // Execute Order (32 bytes)
-    if (msg_size >= 32) {
-      uint64_t order_id = read_le64(data + 16);
-      uint32_t exec_volume = read_le32(data + 24);
-      uint32_t price = read_le32(data + 28);
+  case 103: { // Execute Order (42 bytes)
+    // Spec: OrderID@16(8), TradeID@24(4), Price@28(4), Volume@32(4),
+    //       PrintableFlag@36(1), NumParitySplits@37(1), DBExecID@38(4)
+    // Note: Volume is the executed quantity for THIS execution (not cumulative)
+    if (msg_size >= 42) {
+      uint64_t order_id = read_le64(data + 16); // Offset 16, 8 bytes
+      uint32_t trade_id = read_le32(data + 24); // Offset 24, 4 bytes
+      uint32_t price = read_le32(data + 28);    // Offset 28, 4 bytes
+      uint32_t volume =
+          read_le32(data + 32); // Offset 32, 4 bytes (Executed quantity)
+      uint8_t printable_flag = data[36];          // Offset 36, 1 byte
+      uint8_t num_parity_splits = data[37];       // Offset 37, 1 byte
+      uint32_t db_exec_id = read_le32(data + 38); // Offset 38, 4 bytes
 
       std::cout << "      OrderID: " << order_id << std::endl;
-      std::cout << "      Executed Volume: " << exec_volume << std::endl;
+      std::cout << "      TradeID: " << trade_id << std::endl;
       std::cout << "      Price: $" << std::fixed << std::setprecision(4)
                 << parse_price(price) << std::endl;
+      std::cout << "      Volume: " << volume << std::endl;
+      std::cout << "      Printable Flag: "
+                << (printable_flag == 1 ? "Printed to SIP"
+                                        : "Not Printed to SIP")
+                << std::endl;
+      std::cout << "      Num Parity Splits: " << (int)num_parity_splits
+                << std::endl;
+      if (db_exec_id != 0) {
+        std::cout << "      DBExecID: " << db_exec_id << std::endl;
+      }
+    } else if (msg_size >= 32) {
+      // Fallback for truncated messages
+      uint64_t order_id = read_le64(data + 16);
+      uint32_t trade_id = read_le32(data + 24);
+      uint32_t price = read_le32(data + 28);
+      std::cout << "      OrderID: " << order_id << std::endl;
+      std::cout << "      TradeID: " << trade_id << std::endl;
+      std::cout << "      Price: $" << std::fixed << std::setprecision(4)
+                << parse_price(price) << std::endl;
+      std::cout << "      ERROR: Message truncated (needs 42, has " << msg_size
+                << ")" << std::endl;
     }
     break;
   }
 
   case 104: { // Replace Order (42 bytes)
+    // Spec: OrderID@16(8), NewOrderID@24(8), Price@32(4), Volume@36(4),
+    // PrevPriceParitySplits@40(1), NewPriceParitySplits@41(1)
     if (msg_size >= 42) {
-      uint64_t order_id = read_le64(data + 16);
-      uint64_t new_order_id = read_le64(data + 24);
-      uint32_t price = read_le32(data + 32);
-      uint32_t volume = read_le32(data + 36);
-      uint8_t prev_price_parity_splits = data[40];
-      uint8_t new_price_parity_splits = data[41];
+      uint64_t order_id = read_le64(data + 16);     // Offset 16, 8 bytes
+      uint64_t new_order_id = read_le64(data + 24); // Offset 24, 8 bytes
+      uint32_t price = read_le32(data + 32);        // Offset 32, 4 bytes
+      uint32_t volume = read_le32(data + 36);       // Offset 36, 4 bytes
+      uint8_t prev_price_parity_splits = data[40];  // Offset 40, 1 byte
+      uint8_t new_price_parity_splits = data[41];   // Offset 41, 1 byte
 
       std::cout << "      Old OrderID: " << order_id << std::endl;
       std::cout << "      New OrderID: " << new_order_id << std::endl;
@@ -713,16 +933,27 @@ void parse_xdp_message_verbose(const uint8_t *data, size_t max_len,
     break;
   }
 
-  case 105: { // Imbalance Message
-    if (msg_size >= 60) {
-      uint32_t reference_price = read_le32(data + 16);
-      uint32_t paired_qty = read_le32(data + 20);
-      uint32_t imbalance_qty = read_le32(data + 24);
-      uint8_t imbalance_side = data[28];
-      uint32_t continuous_book_clearing_price = read_le32(data + 29);
-      uint32_t closing_only_clearing_price = read_le32(data + 33);
-      uint8_t ssr_filing_price = data[37];
-      uint32_t indicative_match_price = read_le32(data + 38);
+  case 105: { // Imbalance Message (73 bytes)
+    // Spec: ReferencePrice@16(4), PairedQty@20(4), ImbalanceQty@24(4),
+    // ImbalanceSide@28(1), ContinuousBookClearingPrice@29(4),
+    // AuctionOnlyClearingPrice@33(4), SSR Filing@37(1),
+    // IndicativeMatchPrice@38(4),
+    // ... (fields between 38-71), UnpairedSide@71(1),
+    // SignificantImbalance@72(1)
+    if (msg_size >= 73) {
+      uint32_t reference_price = read_le32(data + 16); // Offset 16, 4 bytes
+      uint32_t paired_qty = read_le32(data + 20);      // Offset 20, 4 bytes
+      uint32_t imbalance_qty = read_le32(data + 24);   // Offset 24, 4 bytes
+      uint8_t imbalance_side = data[28];               // Offset 28, 1 byte
+      uint32_t continuous_book_clearing_price =
+          read_le32(data + 29); // Offset 29, 4 bytes
+      uint32_t closing_only_clearing_price = read_le32(
+          data + 33); // Offset 33, 4 bytes (Auction Only Clearing Price)
+      uint8_t ssr_filing_price = data[37]; // Offset 37, 1 byte
+      uint32_t indicative_match_price =
+          read_le32(data + 38);                 // Offset 38, 4 bytes
+      uint8_t unpaired_side = data[71];         // Offset 71, 1 byte (ASCII)
+      uint8_t significant_imbalance = data[72]; // Offset 72, 1 byte (ASCII)
 
       std::cout << "      Reference Price: $" << std::fixed
                 << std::setprecision(4) << parse_price(reference_price)
@@ -734,7 +965,7 @@ void parse_xdp_message_verbose(const uint8_t *data, size_t max_len,
       std::cout << "      Continuous Book Clearing Price: $" << std::fixed
                 << std::setprecision(4)
                 << parse_price(continuous_book_clearing_price) << std::endl;
-      std::cout << "      Closing Only Clearing Price: $" << std::fixed
+      std::cout << "      Auction Only Clearing Price: $" << std::fixed
                 << std::setprecision(4)
                 << parse_price(closing_only_clearing_price) << std::endl;
       std::cout << "      SSR Filing Price: " << (int)ssr_filing_price
@@ -742,19 +973,61 @@ void parse_xdp_message_verbose(const uint8_t *data, size_t max_len,
       std::cout << "      Indicative Match Price: $" << std::fixed
                 << std::setprecision(4) << parse_price(indicative_match_price)
                 << std::endl;
+      if (unpaired_side != ' ') {
+        std::cout << "      Unpaired Side: " << (char)unpaired_side
+                  << std::endl;
+      }
+      if (significant_imbalance == 'Y') {
+        std::cout << "      Significant Imbalance: Y" << std::endl;
+      }
+    } else if (msg_size >= 60) {
+      // Fallback for older/truncated messages
+      uint32_t reference_price = read_le32(data + 16);
+      uint32_t paired_qty = read_le32(data + 20);
+      uint32_t imbalance_qty = read_le32(data + 24);
+      uint8_t imbalance_side = data[28];
+      uint32_t indicative_match_price = read_le32(data + 38);
+      std::cout << "      Reference Price: $" << std::fixed
+                << std::setprecision(4) << parse_price(reference_price)
+                << std::endl;
+      std::cout << "      Paired Quantity: " << paired_qty << std::endl;
+      std::cout << "      Imbalance Quantity: " << imbalance_qty << std::endl;
+      std::cout << "      Imbalance Side: "
+                << (imbalance_side == 'B' ? "BUY" : "SELL") << std::endl;
+      std::cout << "      Indicative Match Price: $" << std::fixed
+                << std::setprecision(4) << parse_price(indicative_match_price)
+                << std::endl;
+      std::cout << "      ERROR: Message truncated (needs 73, has " << msg_size
+                << ")" << std::endl;
     }
     break;
   }
 
-  case 106: { // Add Order Refresh (39 bytes)
-    if (msg_size >= 39) {
-      uint64_t order_id = read_le64(data + 16);
-      uint32_t price = read_le32(data + 24);
-      uint32_t volume = read_le32(data + 28);
-      uint8_t side = data[32];
+  case 106: { // Add Order Refresh (43 bytes)
+    // Spec: SourceTime@4(4), SourceTimeNS@8(4), SymbolIndex@12(4),
+    // SymbolSeqNum@16(4),
+    //       OrderID@20(8), Price@28(4), Volume@32(4), Side@36(1), FirmID@37(5),
+    //       NumParitySplits@42(1)
+    // Note: Different header structure - uses SourceTime instead of
+    // SourceTimeNS only
+    if (msg_size >= 43) {
+      uint32_t source_time = read_le32(data + 4);    // Offset 4, 4 bytes
+      uint32_t source_time_ns = read_le32(data + 8); // Offset 8, 4 bytes
+      uint32_t symbol_index = read_le32(data + 12);  // Offset 12, 4 bytes
+      uint32_t symbol_seq = read_le32(data + 16);    // Offset 16, 4 bytes
+      uint64_t order_id = read_le64(data + 20);      // Offset 20, 8 bytes
+      uint32_t price = read_le32(data + 28);         // Offset 28, 4 bytes
+      uint32_t volume = read_le32(data + 32);        // Offset 32, 4 bytes
+      uint8_t side = data[36];                       // Offset 36, 1 byte
       char firm_id[6] = {0};
-      memcpy(firm_id, data + 33, 5);
+      memcpy(firm_id, data + 37, 5);        // Offset 37, 5 bytes
+      uint8_t num_parity_splits = data[42]; // Offset 42, 1 byte
 
+      std::cout << "      SourceTime: " << source_time << " seconds"
+                << std::endl;
+      std::cout << "      SourceTimeNS: " << source_time_ns << std::endl;
+      std::cout << "      SymbolIndex: " << symbol_index << std::endl;
+      std::cout << "      SymbolSeqNum: " << symbol_seq << std::endl;
       std::cout << "      OrderID: " << order_id << std::endl;
       std::cout << "      Price: $" << std::fixed << std::setprecision(4)
                 << parse_price(price) << std::endl;
@@ -762,6 +1035,14 @@ void parse_xdp_message_verbose(const uint8_t *data, size_t max_len,
       std::cout << "      Side: " << (side == 'B' ? "BUY" : "SELL")
                 << std::endl;
       std::cout << "      FirmID: '" << firm_id << "'" << std::endl;
+      std::cout << "      Num Parity Splits: " << (int)num_parity_splits
+                << std::endl;
+    } else if (msg_size >= 20) {
+      // Fallback for truncated messages
+      uint64_t order_id = read_le64(data + 20);
+      std::cout << "      OrderID: " << order_id << std::endl;
+      std::cout << "      ERROR: Message truncated (needs 43, has " << msg_size
+                << ")" << std::endl;
     }
     break;
   }
@@ -827,8 +1108,9 @@ void parse_xdp_message_verbose(const uint8_t *data, size_t max_len,
   }
 
   case 114: { // Retail Price Improvement (17 bytes)
+    // Spec: RPIIndicator@16(1) - ' '=None, 'A'=Bid, 'B'=Offer, 'C'=Both
     if (msg_size >= 17) {
-      uint8_t rpi_indicator = data[16];
+      uint8_t rpi_indicator = data[16]; // Offset 16, 1 byte (ASCII)
       std::cout << "      RPI Indicator: ";
       if (rpi_indicator == ' ') {
         std::cout << "' ' (No retail interest)" << std::endl;
@@ -848,14 +1130,26 @@ void parse_xdp_message_verbose(const uint8_t *data, size_t max_len,
     break;
   }
 
-  case 223: { // Stock Summary
-    if (msg_size >= 40) {
-      uint32_t high_price = read_le32(data + 16);
-      uint32_t low_price = read_le32(data + 20);
-      uint32_t open_price = read_le32(data + 24);
-      uint32_t close_price = read_le32(data + 28);
-      uint64_t total_volume = read_le64(data + 32);
+  case 223: { // Stock Summary (36 bytes)
+    // Spec: SourceTime@4(4), SourceTimeNS@8(4), SymbolIndex@12(4),
+    //       HighPrice@16(4), LowPrice@20(4), Open@24(4), Close@28(4),
+    //       TotalVolume@32(4)
+    // Note: Different header structure and TotalVolume is 4 bytes, not 8
+    if (msg_size >= 36) {
+      uint32_t source_time = read_le32(data + 4);    // Offset 4, 4 bytes
+      uint32_t source_time_ns = read_le32(data + 8); // Offset 8, 4 bytes
+      uint32_t symbol_index = read_le32(data + 12);  // Offset 12, 4 bytes
+      uint32_t high_price = read_le32(data + 16);    // Offset 16, 4 bytes
+      uint32_t low_price = read_le32(data + 20);     // Offset 20, 4 bytes
+      uint32_t open_price = read_le32(data + 24);    // Offset 24, 4 bytes
+      uint32_t close_price = read_le32(data + 28);   // Offset 28, 4 bytes
+      uint32_t total_volume =
+          read_le32(data + 32); // Offset 32, 4 bytes (not 8!)
 
+      std::cout << "      SourceTime: " << source_time << " seconds"
+                << std::endl;
+      std::cout << "      SourceTimeNS: " << source_time_ns << std::endl;
+      std::cout << "      SymbolIndex: " << symbol_index << std::endl;
       std::cout << "      High Price: $" << std::fixed << std::setprecision(4)
                 << parse_price(high_price) << std::endl;
       std::cout << "      Low Price: $" << std::fixed << std::setprecision(4)
@@ -865,6 +1159,13 @@ void parse_xdp_message_verbose(const uint8_t *data, size_t max_len,
       std::cout << "      Close Price: $" << std::fixed << std::setprecision(4)
                 << parse_price(close_price) << std::endl;
       std::cout << "      Total Volume: " << total_volume << std::endl;
+    } else if (msg_size >= 16) {
+      // Fallback for truncated messages
+      uint32_t high_price = read_le32(data + 16);
+      std::cout << "      High Price: $" << std::fixed << std::setprecision(4)
+                << parse_price(high_price) << std::endl;
+      std::cout << "      ERROR: Message truncated (needs 36, has " << msg_size
+                << ")" << std::endl;
     }
     break;
   }
@@ -1038,23 +1339,32 @@ void packet_handler(u_char *user_data, const struct pcap_pkthdr *pkthdr,
 
 int main(int argc, char *argv[]) {
   if (argc < 2) {
-    std::cerr << "Usage: " << argv[0]
-              << " <pcap_file> [verbose] [symbol_file] [-t ticker]"
-              << std::endl;
+    std::cerr
+        << "Usage: " << argv[0]
+        << " <pcap_file> [verbose] [symbol_file] [-t ticker] [-m message_type]"
+        << std::endl;
     std::cerr << "  verbose: 0 = simplified output (default)" << std::endl;
     std::cerr << "           1 = detailed output with headers" << std::endl;
-    std::cerr << "  symbol_file: CSV file with symbol mapping (optional)"
+    std::cerr << "  symbol_file: TXT file with symbol mapping (optional)"
               << std::endl;
     std::cerr
         << "  -t ticker: Filter messages for specific ticker symbol (optional)"
         << std::endl;
+    std::cerr << "  -m message_type: Filter messages by type (e.g., ADD_ORDER, "
+                 "MODIFY_ORDER, etc.) (optional)"
+              << std::endl;
     std::cerr << std::endl;
     std::cerr << "Examples:" << std::endl;
-    std::cerr << "  " << argv[0] << " nyse_xdp_data.pcap 0 symbols.csv"
+    std::cerr << "  " << argv[0] << " nyse_xdp_data.pcap 0 symbols.txt"
               << std::endl;
-    std::cerr << "  " << argv[0] << " nyse_xdp_data.pcap 1 symbols.csv"
+    std::cerr << "  " << argv[0] << " nyse_xdp_data.pcap 1 symbols.txt"
               << std::endl;
-    std::cerr << "  " << argv[0] << " nyse_xdp_data.pcap 0 symbols.csv -t AAPL"
+    std::cerr << "  " << argv[0] << " nyse_xdp_data.pcap 0 symbols.txt -t AAPL"
+              << std::endl;
+    std::cerr << "  " << argv[0]
+              << " nyse_xdp_data.pcap 0 symbols.txt -m ADD_ORDER" << std::endl;
+    std::cerr << "  " << argv[0]
+              << " nyse_xdp_data.pcap 0 symbols.txt -t AAPL -m MODIFY_ORDER"
               << std::endl;
     std::cerr << "  " << argv[0] << " nyse_xdp_data.pcap 0" << std::endl;
     return 1;
@@ -1064,7 +1374,7 @@ int main(int argc, char *argv[]) {
   const char *pcap_file = argv[1];
   const char *symbol_file = nullptr;
 
-  // Parse arguments (handle both old style and new -t flag)
+  // Parse arguments (handle flags and positional arguments)
   for (int i = 2; i < argc; i++) {
     if (strcmp(argv[i], "-t") == 0) {
       if (i + 1 < argc) {
@@ -1074,26 +1384,21 @@ int main(int argc, char *argv[]) {
         std::cerr << "Error: -t requires a ticker symbol" << std::endl;
         return 1;
       }
-    } else if (argv[i][0] != '-') {
-      // Non-flag argument: could be verbose or symbol_file
-      if (strcmp(argv[i], "0") == 0 || strcmp(argv[i], "1") == 0) {
-        // This looks like a verbose flag
-        if (verbose_mode == 0) { // Only set if not already set
-          verbose_mode = atoi(argv[i]);
-        } else {
-          // Already set verbose, treat as symbol_file
-          if (symbol_file == nullptr) {
-            symbol_file = argv[i];
-          }
-        }
+    } else if (strcmp(argv[i], "-m") == 0 ||
+               strcmp(argv[i], "--message") == 0) {
+      if (i + 1 < argc) {
+        filter_message = argv[i + 1];
+        i++; // Skip the message type argument
       } else {
-        // Treat as symbol_file
-        if (symbol_file == nullptr) {
-          symbol_file = argv[i];
-        } else {
-          // Both verbose and symbol_file already set, this is unexpected
-          std::cerr << "Warning: Unexpected argument: " << argv[i] << std::endl;
-        }
+        std::cerr << "Error: -m requires a message type" << std::endl;
+        return 1;
+      }
+    } else if (strcmp(argv[i], "0") == 0 || strcmp(argv[i], "1") == 0) {
+      verbose_mode = atoi(argv[i]);
+    } else {
+      // Treat as symbol_file if not a flag and not already set
+      if (symbol_file == nullptr) {
+        symbol_file = argv[i];
       }
     }
   }
@@ -1132,6 +1437,10 @@ int main(int argc, char *argv[]) {
     if (!filter_ticker.empty()) {
       std::cout << "Filtering for ticker: " << filter_ticker << std::endl;
     }
+    if (!filter_message.empty()) {
+      std::cout << "Filtering for message type: " << filter_message
+                << std::endl;
+    }
     std::cout << "=================================================="
               << std::endl;
   } else {
@@ -1141,6 +1450,10 @@ int main(int argc, char *argv[]) {
     }
     if (!filter_ticker.empty()) {
       std::cout << "Filtering for ticker: " << filter_ticker << std::endl;
+    }
+    if (!filter_message.empty()) {
+      std::cout << "Filtering for message type: " << filter_message
+                << std::endl;
     }
     std::cout << "Format: Time Type Ticker [Price Qty Side]" << std::endl;
     std::cout << "Example: 06:30:00.821165 D 68482" << std::endl;
