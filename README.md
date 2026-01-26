@@ -239,6 +239,60 @@ NYSE-XDP/
     └── launch.json         # Debug launch configuration
 ```
 
+## Visualization
+
+The project includes a real-time order book visualizer using Dear ImGui. The visualizer displays:
+- **Order Book Depth**: Bid and ask levels with volume bars
+- **Real-time Statistics**: Best bid/ask, spread, mid price, total quantities
+- **Interactive Controls**: Adjustable display levels, price range, colors
+- **Live Updates**: Order book updates reflected in real-time
+
+### Building the Visualizer
+
+The visualizer requires SDL2 and OpenGL:
+
+**macOS:**
+```bash
+brew install sdl2
+cd build
+cmake ..
+make visualizer
+```
+
+**Linux (Ubuntu/Debian):**
+```bash
+sudo apt-get install libsdl2-dev
+cd build
+cmake ..
+make visualizer
+```
+
+**Linux (Fedora):**
+```bash
+sudo dnf install SDL2-devel
+cd build
+cmake ..
+make visualizer
+```
+
+### Running the Visualizer
+
+```bash
+./build/visualizer
+```
+
+The visualizer currently displays sample order book data. To connect it to live XDP data, you'll need to integrate it with the `reader.cpp` parser to feed order book updates in real-time.
+
+### Visualizer Features
+
+- **Order Book Display**: Visual representation of bid/ask levels
+- **Volume Bars**: Proportional width bars showing order quantities
+- **Price Scale**: Left-side price axis for reference
+- **Spread Indicator**: Yellow line showing the bid-ask spread
+- **Statistics Panel**: Real-time market statistics
+- **Customizable Colors**: Adjustable bid/ask/spread colors
+- **Auto-scaling**: Automatic price range adjustment or manual control
+
 ## Implementation Notes
 
 - Uses `#pragma pack(push, 1)` to ensure structure packing matches binary format

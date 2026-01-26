@@ -59,6 +59,109 @@ target_compile_options(reader PRIVATE
     -Wpedantic
 )
 
+# Find SDL2 for visualization
+find_package(SDL2 QUIET)
+if(NOT SDL2_FOUND)
+    # Try to find SDL2 manually (common on macOS with Homebrew)
+    find_path(SDL2_INCLUDE_DIR SDL.h
+        PATHS
+            /usr/local/include/SDL2
+            /opt/homebrew/include/SDL2
+            /usr/include/SDL2
+    )
+    find_library(SDL2_LIBRARY
+        NAMES SDL2
+        PATHS
+            /usr/local/lib
+            /opt/homebrew/lib
+            /usr/lib
+    )
+    if(SDL2_INCLUDE_DIR AND SDL2_LIBRARY)
+        set(SDL2_FOUND TRUE)
+        set(SDL2_INCLUDE_DIRS ${SDL2_INCLUDE_DIR})
+        set(SDL2_LIBRARIES ${SDL2_LIBRARY})
+    else()
+        message(FATAL_ERROR "SDL2 not found. Please install SDL2:\n  macOS: brew install sdl2\n  Ubuntu/Debian: sudo apt-get install libsdl2-dev\n  Fedora: sudo dnf install SDL2-devel")
+    endif()
+endif()
+
+# ImGui source files
+set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/thirdparty/imgui)
+set(IMGUI_SOURCES
+    ${IMGUI_DIR}/imgui.cpp
+    ${IMGUI_DIR}/imgui_demo.cpp
+    ${IMGUI_DIR}/imgui_draw.cpp
+    ${IMGUI_DIR}/imgui_tables.cpp
+    ${IMGUI_DIR}/imgui_widgets.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_sdl2.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
+)
+
+# Visualization executable (standalone with sample data)
+add_executable(visualizer
+    visualization.cpp
+    ${IMGUI_SOURCES}
+)
+
+# Visualizer with PCAP support
+add_executable(visualizer_pcap
+    visualizer_pcap.cpp
+    ${IMGUI_SOURCES}
+)
+
+target_include_directories(visualizer PRIVATE
+    ${IMGUI_DIR}
+    ${IMGUI_DIR}/backends
+    ${SDL2_INCLUDE_DIRS}
+)
+
+target_link_libraries(visualizer PRIVATE
+    ${SDL2_LIBRARIES}
+)
+
+# Visualizer with PCAP support
+target_include_directories(visualizer_pcap PRIVATE
+    ${IMGUI_DIR}
+    ${IMGUI_DIR}/backends
+    ${SDL2_INCLUDE_DIRS}
+    ${LIBPCAP_INCLUDE_DIRS}
+)
+
+target_link_libraries(visualizer_pcap PRIVATE
+    ${SDL2_LIBRARIES}
+    ${LIBPCAP_LIBRARIES}
+)
+
+# OpenGL linking for visualizer_pcap
+if(APPLE)
+    find_library(OPENGL_LIBRARY OpenGL)
+    target_link_libraries(visualizer_pcap PRIVATE ${OPENGL_LIBRARY})
+else()
+    find_package(OpenGL REQUIRED)
+    target_link_libraries(visualizer_pcap PRIVATE OpenGL::GL)
+endif()
+
+# Compiler flags for visualizer_pcap
+target_compile_options(visualizer_pcap PRIVATE
+    -Wall
+    -Wextra
+)
+
+# OpenGL linking
+if(APPLE)
+    find_library(OPENGL_LIBRARY OpenGL)
+    target_link_libraries(visualizer PRIVATE ${OPENGL_LIBRARY})
+else()
+    find_package(OpenGL REQUIRED)
+    target_link_libraries(visualizer PRIVATE OpenGL::GL)
+endif()
+
+# Compiler flags for visualizer
+target_compile_options(visualizer PRIVATE
+    -Wall
+    -Wextra
+)
+
 # Debug flags
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0")
 # Release flags
