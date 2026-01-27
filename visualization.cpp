@@ -14,7 +14,17 @@
 #include <string>
 #include <vector>
 
-class OrderBookVisualizer {
+struct PlaybackControls
+{
+  bool play_pressed = false;
+  bool pause_pressed = false;
+  bool reset_pressed = false;
+  bool seek_requested = false;
+  size_t seek_index = 0;
+};
+
+class OrderBookVisualizer
+{
 private:
   OrderBook &order_book;
   SDL_Window *window;
@@ -26,17 +36,27 @@ private:
   bool auto_scale = true;
   float price_range = 5.0f; // +/- from mid price
 
+  // Playback controls
+  PlaybackControls playback_controls;
+  bool play_button_pressed = false;
+  bool pause_button_pressed = false;
+  bool reset_button_pressed = false;
+  float timeline_pos = 0.0f;
+
   // Color settings
-  ImVec4 bid_color = ImVec4(0.0f, 1.0f, 0.0f, 0.7f);    // Green
-  ImVec4 ask_color = ImVec4(1.0f, 0.0f, 0.0f, 0.7f);    // Red
-  ImVec4 spread_color = ImVec4(1.0f, 1.0f, 0.0f, 1.0f); // Yellow
-  ImVec4 trade_color = ImVec4(0.0f, 0.5f, 1.0f, 1.0f);  // Blue
+  ImVec4 bid_color = ImVec4(0.0f, 1.0f, 0.0f, 0.8f);     // Green
+  ImVec4 ask_color = ImVec4(1.0f, 0.0f, 0.0f, 0.8f);     // Red
+  ImVec4 spread_color = ImVec4(1.0f, 1.0f, 0.0f, 0.2f);  // Yellow
+  ImVec4 text_color = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);    // White
+  ImVec4 background = ImVec4(0.05f, 0.05f, 0.05f, 1.0f); // Dark gray
 
 public:
   OrderBookVisualizer(OrderBook &ob) : order_book(ob), window(nullptr) {}
 
-  bool init() {
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+  bool init()
+  {
+    if (SDL_Init(SDL_INIT_VIDEO) != 0)
+    {
       std::cerr << "SDL_Init Error: " << SDL_GetError() << std::endl;
       return false;
     }
@@ -54,13 +74,15 @@ public:
                               SDL_WINDOWPOS_CENTERED, 1600, 900,
                               SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
 
-    if (!window) {
+    if (!window)
+    {
       std::cerr << "Window creation failed: " << SDL_GetError() << std::endl;
       return false;
     }
 
     gl_context = SDL_GL_CreateContext(window);
-    if (!gl_context) {
+    if (!gl_context)
+    {
       std::cerr << "OpenGL context creation failed: " << SDL_GetError()
                 << std::endl;
       std::cerr << "Trying with compatibility profile..." << std::endl;
@@ -69,7 +91,8 @@ public:
       SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
       SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
       gl_context = SDL_GL_CreateContext(window);
-      if (!gl_context) {
+      if (!gl_context)
+      {
         std::cerr << "Failed to create OpenGL context" << std::endl;
         return false;
       }
@@ -88,14 +111,20 @@ public:
 #else
                                                // For other platforms, try to
                                                // detect from OpenGL version
-    if (gl_version) {
+    if (gl_version)
+    {
       int major = 0, minor = 0;
       sscanf(gl_version, "%d.%d", &major, &minor);
-      if (major >= 3 && minor >= 3) {
+      if (major >= 3 && minor >= 3)
+      {
         glsl_version = "#version 330";
-      } else if (major >= 3 && minor >= 2) {
+      }
+      else if (major >= 3 && minor >= 2)
+      {
         glsl_version = "#version 150";
-      } else {
+      }
+      else
+      {
         glsl_version = "#version 130";
       }
     }
@@ -107,7 +136,8 @@ public:
     ImGui::StyleColorsDark();
 
     ImGui_ImplSDL2_InitForOpenGL(window, gl_context);
-    if (!ImGui_ImplOpenGL3_Init(glsl_version)) {
+    if (!ImGui_ImplOpenGL3_Init(glsl_version))
+    {
       std::cerr << "Failed to initialize ImGui OpenGL3 renderer with GLSL: "
                 << glsl_version << std::endl;
       std::cerr << "OpenGL Version: " << (gl_version ? gl_version : "Unknown")
@@ -117,14 +147,16 @@ public:
 
     std::cout << "ImGui initialized successfully with GLSL: " << glsl_version
               << std::endl;
-    if (gl_version) {
+    if (gl_version)
+    {
       std::cout << "OpenGL Version: " << gl_version << std::endl;
     }
 
     return true;
   }
 
-  void render() {
+  void render()
+  {
     ImGuiIO &io = ImGui::GetIO();
 
     // Start the Dear ImGui frame
@@ -140,16 +172,14 @@ public:
                      ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_NoBringToFrontOnFocus);
 
-    // Control panel
-    ImGui::BeginChild("Controls", ImVec2(300, 0), true);
-    render_controls();
+    // Control panel and playback
+    ImGui::BeginChild("Controls", ImVec2(0, 120), true);
+    render_playback_controls();
     ImGui::EndChild();
 
-    ImGui::SameLine();
-
-    // Order book visualization
-    ImGui::BeginChild("Visualization", ImVec2(0, 0), true);
-    render_order_book();
+    // Main order book display
+    ImGui::BeginChild("OrderBook", ImVec2(0, 0), true);
+    render_order_book_terminal_style();
     ImGui::EndChild();
 
     ImGui::End();
@@ -157,141 +187,196 @@ public:
     // Rendering
     ImGui::Render();
     glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);
-    glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+    glClearColor(background.x, background.y, background.z, background.w);
     glClear(GL_COLOR_BUFFER_BIT);
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     SDL_GL_SwapWindow(window);
   }
 
-  void render_controls() {
-    ImGui::Text("Order Book Controls");
-    ImGui::Separator();
+  void render(size_t current_packet_idx, size_t total_packets)
+  {
+    ImGuiIO &io = ImGui::GetIO();
 
-    ImGui::SliderInt("Max Levels", &max_display_levels, 5, 50);
-    ImGui::Checkbox("Show Volume Bars", &show_volume_bars);
-    ImGui::Checkbox("Auto Scale", &auto_scale);
+    // Start the Dear ImGui frame
+    ImGui_ImplOpenGL3_NewFrame();
+    ImGui_ImplSDL2_NewFrame();
+    ImGui::NewFrame();
 
-    if (!auto_scale) {
-      ImGui::SliderFloat("Price Range", &price_range, 0.1f, 20.0f);
+    // Main window
+    ImGui::SetNextWindowPos(ImVec2(0, 0));
+    ImGui::SetNextWindowSize(io.DisplaySize);
+    ImGui::Begin("Order Book", nullptr,
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                     ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+    // Playback controls section
+    ImGui::BeginChild("Controls", ImVec2(0, 130), true);
+    render_playback_controls(current_packet_idx, total_packets);
+    ImGui::EndChild();
+
+    // Main order book display
+    ImGui::BeginChild("OrderBook", ImVec2(0, 0), true);
+    render_order_book_terminal_style();
+    ImGui::EndChild();
+
+    ImGui::End();
+
+    // Rendering
+    ImGui::Render();
+    glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);
+    glClearColor(background.x, background.y, background.z, background.w);
+    glClear(GL_COLOR_BUFFER_BIT);
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    SDL_GL_SwapWindow(window);
+  }
+
+  void render_playback_controls()
+  {
+    ImGui::Text("Playback Controls");
+    ImGui::SameLine(200);
+
+    if (ImGui::Button("Play##single", ImVec2(60, 0)))
+    {
+      playback_controls.play_pressed = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Pause", ImVec2(60, 0)))
+    {
+      playback_controls.pause_pressed = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Reset", ImVec2(60, 0)))
+    {
+      playback_controls.reset_pressed = true;
+    }
+  }
+
+  void render_playback_controls(size_t current_packet_idx, size_t total_packets)
+  {
+    ImGui::Text("Playback Controls");
+    ImGui::SameLine(200);
+
+    if (ImGui::Button("Play##single", ImVec2(60, 0)))
+    {
+      playback_controls.play_pressed = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Pause", ImVec2(60, 0)))
+    {
+      playback_controls.pause_pressed = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Reset", ImVec2(60, 0)))
+    {
+      playback_controls.reset_pressed = true;
     }
 
     ImGui::Separator();
-    ImGui::Text("Colors:");
-    ImGui::ColorEdit3("Bid Color", (float *)&bid_color);
-    ImGui::ColorEdit3("Ask Color", (float *)&ask_color);
-    ImGui::ColorEdit3("Spread Color", (float *)&spread_color);
+    ImGui::Text("Timeline: %zu / %zu packets", current_packet_idx, total_packets);
 
-    ImGui::Separator();
-
-    // Show statistics
-    auto stats = order_book.get_stats();
-    ImGui::Text("Statistics:");
-    ImGui::Text("Best Bid: $%.4f", stats.best_bid);
-    ImGui::Text("Best Ask: $%.4f", stats.best_ask);
-    ImGui::Text("Spread: $%.4f", stats.spread);
-    ImGui::Text("Mid Price: $%.4f", stats.mid_price);
-    ImGui::Text("Total Bid Qty: %u", stats.total_bid_qty);
-    ImGui::Text("Total Ask Qty: %u", stats.total_ask_qty);
-    ImGui::Text("Bid Levels: %d", stats.bid_levels);
-    ImGui::Text("Ask Levels: %d", stats.ask_levels);
-    ImGui::Text("Last Trade: $%.4f", order_book.get_last_trade());
+    // Timeline slider
+    static float seek_pos = 0.0f;
+    float normalized_pos = total_packets > 0 ? (float)current_packet_idx / total_packets : 0.0f;
+    if (ImGui::SliderFloat("##timeline", &normalized_pos, 0.0f, 1.0f, "%.1f%%"))
+    {
+      size_t target_idx = (size_t)(normalized_pos * total_packets);
+      playback_controls.seek_requested = true;
+      playback_controls.seek_index = target_idx;
+    }
   }
 
-  void render_order_book() {
+  void render_order_book_terminal_style()
+  {
     auto stats = order_book.get_stats();
     auto bids = order_book.get_bids();
     auto asks = order_book.get_asks();
 
-    ImDrawList *draw_list = ImGui::GetWindowDrawList();
-    ImVec2 canvas_size = ImGui::GetContentRegionAvail();
+    ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "ORDER BOOK - MID: $%.2f | SPREAD: $%.4f",
+                       stats.mid_price, stats.spread);
+    ImGui::Separator();
 
-    // Determine price range
-    double min_price, max_price;
-    if (auto_scale) {
-      min_price = stats.best_bid - stats.spread * 5;
-      max_price = stats.best_ask + stats.spread * 5;
-    } else {
-      double mid = stats.mid_price;
-      min_price = mid - price_range;
-      max_price = mid + price_range;
+    // Header row
+    ImGui::TextColored(text_color, "%-12s %-15s %-15s", "ASK SIZE", "ASK PRICE", "BID PRICE");
+    ImGui::TextColored(text_color, "%-12s %-15s %-15s", "", "", "BID SIZE");
+    ImGui::Separator();
+
+    int max_levels = std::min(max_display_levels,
+                              (int)std::max(bids.size(), asks.size()));
+
+    // Display from best ask down, and best bid up
+    std::vector<std::pair<double, uint32_t>> asks_vec(asks.begin(), asks.end());
+    std::vector<std::pair<double, uint32_t>> bids_vec(bids.begin(), bids.end());
+
+    // Reverse asks to show best ask at top
+    std::reverse(asks_vec.begin(), asks_vec.end());
+
+    int ask_idx = 0;
+    int bid_idx = 0;
+
+    for (int level = 0; level < max_levels; level++)
+    {
+      std::string ask_str = "                    ";
+      std::string bid_str = "                    ";
+
+      if (ask_idx < (int)asks_vec.size())
+      {
+        char buf[100];
+        double price = asks_vec[ask_idx].first;
+        uint32_t qty = asks_vec[ask_idx].second;
+        snprintf(buf, sizeof(buf), "%u @ $%.2f", qty, price);
+        ask_str = buf;
+        ask_idx++;
+      }
+
+      if (bid_idx < (int)bids_vec.size())
+      {
+        char buf[100];
+        double price = bids_vec[bid_idx].first;
+        uint32_t qty = bids_vec[bid_idx].second;
+        snprintf(buf, sizeof(buf), "%.2f @ %u", price, qty);
+        bid_str = buf;
+        bid_idx++;
+      }
+
+      // Color code: red for asks, green for bids
+      if (ask_idx <= (int)asks_vec.size() - 1)
+      {
+        ImGui::TextColored(ask_color, "%-12s %-15s %-15s", "", ask_str.c_str(), "");
+      }
+      else
+      {
+        ImGui::TextColored(text_color, "%-12s %-15s %-15s", "", "", "");
+      }
+
+      ImGui::SameLine(300);
+
+      if (bid_idx <= (int)bids_vec.size())
+      {
+        ImGui::TextColored(bid_color, "%-15s", bid_str.c_str());
+      }
     }
 
-    // Price scale (left side)
-    ImGui::BeginChild("PriceScale", ImVec2(80, canvas_size.y), true);
-    for (double price = max_price; price >= min_price;
-         price -= (max_price - min_price) / 20.0) {
-      ImGui::Text("$%.2f", price);
-    }
-    ImGui::EndChild();
-
-    ImGui::SameLine();
-
-    // Main visualization area
-    ImGui::BeginChild("BookArea", ImVec2(canvas_size.x - 80, canvas_size.y),
-                      true);
-
-    ImVec2 book_pos = ImGui::GetCursorScreenPos();
-    ImVec2 book_size = ImGui::GetContentRegionAvail();
-
-    // Draw spread line
-    float spread_y = book_pos.y + book_size.y * 0.5f;
-    draw_list->AddLine(ImVec2(book_pos.x, spread_y),
-                       ImVec2(book_pos.x + book_size.x, spread_y),
-                       ImColor(spread_color), 2.0f);
-
-    // Draw bids (below spread)
-    int bid_count = 0;
-    for (const auto &pair : bids) {
-      if (bid_count++ >= max_display_levels)
-        break;
-      double price = pair.first;
-      uint32_t qty = pair.second;
-      if (price < min_price)
-        continue;
-
-      float price_height =
-          (float)((price - min_price) / (max_price - min_price));
-      float y = book_pos.y + book_size.y * (1.0f - price_height);
-      float width = std::min(qty / 1000.0f, 1.0f) * book_size.x * 0.4f;
-
-      draw_list->AddRectFilled(ImVec2(book_pos.x, y - 2),
-                               ImVec2(book_pos.x + width, y + 2),
-                               ImColor(bid_color));
-
-      // Price label
-      ImGui::SetCursorScreenPos(ImVec2(book_pos.x + width + 5, y - 8));
-      ImGui::Text("$%.2f x %u", price, qty);
-    }
-
-    // Draw asks (above spread)
-    int ask_count = 0;
-    for (const auto &pair : asks) {
-      if (ask_count++ >= max_display_levels)
-        break;
-      double price = pair.first;
-      uint32_t qty = pair.second;
-      if (price > max_price)
-        continue;
-
-      float price_height =
-          (float)((price - min_price) / (max_price - min_price));
-      float y = book_pos.y + book_size.y * (1.0f - price_height);
-      float width = std::min(qty / 1000.0f, 1.0f) * book_size.x * 0.4f;
-
-      draw_list->AddRectFilled(ImVec2(book_pos.x + book_size.x - width, y - 2),
-                               ImVec2(book_pos.x + book_size.x, y + 2),
-                               ImColor(ask_color));
-
-      // Price label
-      ImGui::SetCursorScreenPos(
-          ImVec2(book_pos.x + book_size.x - width - 50, y - 8));
-      ImGui::Text("%u x $%.2f", qty, price);
-    }
-
-    ImGui::EndChild();
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
+                       "Bid Levels: %d | Ask Levels: %d | Bid Vol: %u | Ask Vol: %u",
+                       stats.bid_levels, stats.ask_levels,
+                       stats.total_bid_qty, stats.total_ask_qty);
   }
 
-  void cleanup() {
+  PlaybackControls get_playback_controls()
+  {
+    auto controls = playback_controls;
+    // Reset one-time events
+    playback_controls.play_pressed = false;
+    playback_controls.pause_pressed = false;
+    playback_controls.reset_pressed = false;
+    playback_controls.seek_requested = false;
+    return controls;
+  }
+
+  void cleanup()
+  {
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL2_Shutdown();
     ImGui::DestroyContext();
@@ -301,16 +386,20 @@ public:
     SDL_Quit();
   }
 
-  bool should_close() {
+  bool should_close()
+  {
     SDL_Event event;
-    while (SDL_PollEvent(&event)) {
+    while (SDL_PollEvent(&event))
+    {
       ImGui_ImplSDL2_ProcessEvent(&event);
-      if (event.type == SDL_QUIT) {
+      if (event.type == SDL_QUIT)
+      {
         return true;
       }
       if (event.type == SDL_WINDOWEVENT &&
           event.window.event == SDL_WINDOWEVENT_CLOSE &&
-          event.window.windowID == SDL_GetWindowID(window)) {
+          event.window.windowID == SDL_GetWindowID(window))
+      {
         return true;
       }
     }
@@ -319,7 +408,8 @@ public:
 };
 
 // Main function
-int main(int /*argc*/, char * /*argv*/[]) {
+int main(int /*argc*/, char * /*argv*/[])
+{
   // Create a test order book
   OrderBook order_book;
 
@@ -334,15 +424,18 @@ int main(int /*argc*/, char * /*argv*/[]) {
   // Create visualizer
   OrderBookVisualizer visualizer(order_book);
 
-  if (!visualizer.init()) {
+  if (!visualizer.init())
+  {
     std::cerr << "Failed to initialize visualizer" << std::endl;
     return 1;
   }
 
   // Main loop
   bool running = true;
-  while (running) {
-    if (visualizer.should_close()) {
+  while (running)
+  {
+    if (visualizer.should_close())
+    {
       running = false;
     }
 

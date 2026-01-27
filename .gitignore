@@ -16,7 +16,7 @@ cmake-build*/
 *.swp
 # clangd/compile_commands.json, etc.
 compile_commands.json
-
+.cache
 # Ignore macOS, Windows, and Linux system files
 .DS_Store
 Thumbs.db
