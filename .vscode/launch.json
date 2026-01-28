@@ -1,0 +1,67 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Visualizer: AAPL",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/visualizer_pcap",
+      "args": [
+        "data/ny4-xnys-pillar-a-20230822T133000.pcap",
+        "-t",
+        "AAPL",
+        "-s",
+        "data/symbol_nyse.txt"
+      ],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "externalConsole": false,
+      "MIMode": "lldb",
+      "preLaunchTask": "build"
+    },
+    {
+      "name": "Visualizer: All Symbols",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/visualizer_pcap",
+      "args": [
+        "data/ny4-xnys-pillar-a-20230822T133000.pcap",
+        "-s",
+        "data/symbol_nyse.txt"
+      ],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "externalConsole": false,
+      "MIMode": "lldb",
+      "preLaunchTask": "build"
+    },
+    {
+      "name": "Visualizer: Custom Ticker",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/visualizer_pcap",
+      "args": [
+        "data/ny4-xnys-pillar-a-20230822T133000.pcap",
+        "-t",
+        "${input:ticker}",
+        "-s",
+        "data/symbol_nyse.txt"
+      ],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "externalConsole": false,
+      "MIMode": "lldb",
+      "preLaunchTask": "build"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "ticker",
+      "type": "promptString",
+      "description": "Enter ticker symbol (e.g., AAPL, MSFT, TSLA)"
+    }
+  ]
+}

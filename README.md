@@ -115,7 +115,7 @@ g++ -std=c++11 reader.cpp -lpcap -o reader
 ### Arguments
 - **pcap_file**: Path to PCAP file containing XDP data (required)
 - **verbose**: `0` = simplified output, `1` = detailed verbose output (optional, default: 0)
-- **symbol_file**: Path to symbol mapping file (optional, default: symbol_nyse.txt)
+- **symbol_file**: Path to symbol mapping file (optional, default: data/symbol_nyse.txt for visualizers)
 - **-t ticker**: Filter messages for specific ticker symbol (e.g., `-t AAPL`)
 
 ### Examples
@@ -132,12 +132,12 @@ g++ -std=c++11 reader.cpp -lpcap -o reader
 
 #### Filter for specific ticker
 ```bash
-./reader data/ny4-xnys-pillar-a-20230822T133000.pcap 0 symbol_nyse.txt -t AAPL
+./reader data/ny4-xnys-pillar-a-20230822T133000.pcap 0 data/symbol_nyse.txt -t AAPL
 ```
 
 #### Verbose output for specific ticker
 ```bash
-./reader data/ny4-xnys-pillar-a-20230822T133000.pcap 1 symbol_nyse.txt -t AAPL
+./reader data/ny4-xnys-pillar-a-20230822T133000.pcap 1 data/symbol_nyse.txt -t AAPL
 ```
 
 ### Output Format
@@ -218,7 +218,7 @@ make
 
 # Run with gdb
 gdb ./reader
-(gdb) run data/ny4-xnys-pillar-a-20230822T133000.pcap 0 symbol_nyse.txt -t AAPL
+(gdb) run data/ny4-xnys-pillar-a-20230822T133000.pcap 0 data/symbol_nyse.txt -t AAPL
 ```
 
 ## Project Structure
@@ -226,37 +226,52 @@ gdb ./reader
 ```
 NYSE-XDP/
 ├── CMakeLists.txt          # CMake build configuration
-├── reader.cpp              # Main parser implementation
+├── reader.cpp              # Command-line parser implementation
+├── order_book.hpp          # Order book data structure
+├── visualization.cpp       # ImGui visualization components
+├── visualizer_main.cpp     # PCAP visualizer with playback controls
+├── visualizer_pcap.cpp     # Alternative PCAP visualizer implementation
 ├── README.md               # This file
-├── symbol_nyse.txt         # Symbol index mapping
-├── data/                   # PCAP data files
-│   └── ny4-xnys-pillar-a-20230822T133000.pcap
+├── data/                   # Data files
+│   ├── ny4-xnys-pillar-a-20230822T133000.pcap
+│   └── symbol_nyse.txt     # Symbol index mapping
 ├── data_sheets/            # Protocol specifications
 │   ├── XDP_Integrated_Feed_Client_Specification_v2.3a.pdf
 │   └── XDP_Common_Client_Specification_v2.3c.pdf
-└── .vscode/                # VS Code configuration
-    ├── tasks.json          # Build tasks
-    └── launch.json         # Debug launch configuration
+├── documentation/          # Architecture and design documentation
+│   └── ARCHITECTURE.md     # System architecture documentation
+└── thirdparty/             # Third-party dependencies
+    └── imgui/              # Dear ImGui library
 ```
 
 ## Visualization
 
-The project includes a real-time order book visualizer using Dear ImGui. The visualizer displays:
-- **Order Book Depth**: Bid and ask levels with volume bars
-- **Real-time Statistics**: Best bid/ask, spread, mid price, total quantities
-- **Interactive Controls**: Adjustable display levels, price range, colors
-- **Live Updates**: Order book updates reflected in real-time
+The project includes multiple visualization tools for real-time order book analysis:
 
-### Building the Visualizer
+### 1. Command-Line Reader (`reader`)
+Basic parser that outputs XDP messages to console in simplified or verbose format.
 
-The visualizer requires SDL2 and OpenGL:
+### 2. Standalone Visualizer (`visualizer`)
+Simple visualizer with sample data for testing the UI components.
+
+### 3. PCAP Visualizer (`visualizer_pcap`)
+Full-featured visualizer with PCAP file playback support, featuring:
+- **Terminal-Style Order Book**: Traditional bid/ask ladder display
+- **Playback Controls**: Play, pause, reset, and timeline seeking
+- **Real-time Updates**: Order book updates as packets are processed
+- **Symbol Filtering**: Filter by specific ticker symbols
+- **Statistics Display**: Best bid/ask, spread, mid price, volume totals
+
+### Building the Visualizers
+
+The visualizers require SDL2 and OpenGL:
 
 **macOS:**
 ```bash
 brew install sdl2
 cd build
 cmake ..
-make visualizer
+make
 ```
 
 **Linux (Ubuntu/Debian):**
@@ -264,7 +279,7 @@ make visualizer
 sudo apt-get install libsdl2-dev
 cd build
 cmake ..
-make visualizer
+make
 ```
 
 **Linux (Fedora):**
@@ -272,26 +287,36 @@ make visualizer
 sudo dnf install SDL2-devel
 cd build
 cmake ..
-make visualizer
+make
 ```
 
-### Running the Visualizer
+### Running the Visualizers
 
+**Command-line reader:**
+```bash
+./build/reader data/ny4-xnys-pillar-a-20230822T133000.pcap 0 data/symbol_nyse.txt -t AAPL
+```
+
+**PCAP visualizer with playback:**
+```bash
+./build/visualizer_pcap data/ny4-xnys-pillar-a-20230822T133000.pcap -t AAPL
+# Or specify custom symbol file:
+./build/visualizer_pcap data/ny4-xnys-pillar-a-20230822T133000.pcap -t AAPL -s data/symbol_nyse.txt
+```
+
+**Standalone visualizer (sample data):**
 ```bash
 ./build/visualizer
 ```
 
-The visualizer currently displays sample order book data. To connect it to live XDP data, you'll need to integrate it with the `reader.cpp` parser to feed order book updates in real-time.
-
 ### Visualizer Features
 
-- **Order Book Display**: Visual representation of bid/ask levels
-- **Volume Bars**: Proportional width bars showing order quantities
-- **Price Scale**: Left-side price axis for reference
-- **Spread Indicator**: Yellow line showing the bid-ask spread
-- **Statistics Panel**: Real-time market statistics
-- **Customizable Colors**: Adjustable bid/ask/spread colors
-- **Auto-scaling**: Automatic price range adjustment or manual control
+- **Terminal-Style Order Book**: Traditional market data terminal layout showing bid/ask levels
+- **Playback Controls**: Interactive timeline with play, pause, reset, and seek functionality
+- **Real-time Statistics**: Best bid/ask, spread, mid price, total quantities, level counts
+- **Symbol Filtering**: Filter messages by ticker symbol via command-line
+- **Thread-Safe Updates**: Multi-threaded packet processing with safe order book updates
+- **Customizable Display**: Adjustable number of levels, colors, and display options
 
 ## Implementation Notes
 
@@ -304,6 +329,10 @@ The visualizer currently displays sample order book data. To connect it to live 
 ## License
 
 This project is for educational and research purposes. NYSE XDP protocol specifications are copyright Intercontinental Exchange, Inc.
+
+## Documentation
+
+- **[Architecture Documentation](documentation/ARCHITECTURE.md)**: Comprehensive system architecture, component design, data flow, and threading model documentation
 
 ## References
 

@@ -12,7 +12,6 @@ data/
 build/
 cmake-build*/
 *.vcxproj*
-.vscode/
 *.swp
 # clangd/compile_commands.json, etc.
 compile_commands.json

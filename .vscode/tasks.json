@@ -1,0 +1,81 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build",
+      "type": "shell",
+      "command": "cmake --build build --target visualizer_pcap",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": [
+        "$gcc"
+      ],
+      "presentation": {
+        "reveal": "silent",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "build all",
+      "type": "shell",
+      "command": "cmake --build build",
+      "group": "build",
+      "problemMatcher": [
+        "$gcc"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "clean",
+      "type": "shell",
+      "command": "cmake --build build --target clean",
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "run visualizer (AAPL)",
+      "type": "shell",
+      "command": "${workspaceFolder}/build/visualizer_pcap",
+      "args": [
+        "data/ny4-xnys-pillar-a-20230822T133000.pcap",
+        "-t",
+        "AAPL",
+        "-s",
+        "data/symbol_nyse.txt"
+      ],
+      "group": "test",
+      "dependsOn": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
+      "label": "run visualizer (all symbols)",
+      "type": "shell",
+      "command": "${workspaceFolder}/build/visualizer_pcap",
+      "args": [
+        "data/ny4-xnys-pillar-a-20230822T133000.pcap",
+        "-s",
+        "data/symbol_nyse.txt"
+      ],
+      "group": "test",
+      "dependsOn": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    }
+  ]
+}

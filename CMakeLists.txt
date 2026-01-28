@@ -39,12 +39,16 @@ if(NOT LIBPCAP_FOUND)
   message(FATAL_ERROR "libpcap library not found. Please install libpcap-dev (Linux) or libpcap (macOS)")
 endif()
 
+# Source directory
+set(SOURCE_DIR ${CMAKE_SOURCE_DIR}/src)
+
 # Main parser executable
 add_executable(reader
-    reader.cpp
+    ${SOURCE_DIR}/reader.cpp
 )
 
 target_include_directories(reader PRIVATE
+    ${SOURCE_DIR}
     ${LIBPCAP_INCLUDE_DIRS}
 )
 
@@ -99,17 +103,19 @@ set(IMGUI_SOURCES
 
 # Visualization executable (standalone with sample data)
 add_executable(visualizer
-    visualization.cpp
+    ${SOURCE_DIR}/visualization.cpp
     ${IMGUI_SOURCES}
 )
 
 # Visualizer with PCAP support
 add_executable(visualizer_pcap
-    visualizer_pcap.cpp
+    ${SOURCE_DIR}/visualizer_pcap.cpp
     ${IMGUI_SOURCES}
 )
 
 target_include_directories(visualizer PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${SOURCE_DIR}
     ${IMGUI_DIR}
     ${IMGUI_DIR}/backends
     ${SDL2_INCLUDE_DIRS}
@@ -121,6 +127,8 @@ target_link_libraries(visualizer PRIVATE
 
 # Visualizer with PCAP support
 target_include_directories(visualizer_pcap PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${SOURCE_DIR}
     ${IMGUI_DIR}
     ${IMGUI_DIR}/backends
     ${SDL2_INCLUDE_DIRS}
@@ -171,6 +179,6 @@ set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Install targets
-install(TARGETS reader
+install(TARGETS reader visualizer visualizer_pcap
     RUNTIME DESTINATION bin
 )
