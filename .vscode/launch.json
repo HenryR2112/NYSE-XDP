@@ -55,6 +55,58 @@
       "externalConsole": false,
       "MIMode": "lldb",
       "preLaunchTask": "build"
+    },
+    {
+      "name": "Market Maker: AAPL",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/market_maker_sim",
+      "args": [
+        "data/ny4-xnys-pillar-a-20230822T133000.pcap",
+        "data/symbol_nyse.txt",
+        "-t",
+        "AAPL"
+      ],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "externalConsole": false,
+      "MIMode": "lldb",
+      "preLaunchTask": "build market_maker_sim"
+    },
+    {
+      "name": "Market Maker: All Symbols",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/market_maker_sim",
+      "args": [
+        "data/ny4-xnys-pillar-a-20230822T133000.pcap",
+        "data/symbol_nyse.txt"
+      ],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "externalConsole": false,
+      "MIMode": "lldb",
+      "preLaunchTask": "build market_maker_sim"
+    },
+    {
+      "name": "Market Maker: Custom Ticker",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/market_maker_sim",
+      "args": [
+        "data/ny4-xnys-pillar-a-20230822T133000.pcap",
+        "data/symbol_nyse.txt",
+        "-t",
+        "${input:ticker}"
+      ],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "externalConsole": false,
+      "MIMode": "lldb",
+      "preLaunchTask": "build market_maker_sim"
     }
   ],
   "inputs": [

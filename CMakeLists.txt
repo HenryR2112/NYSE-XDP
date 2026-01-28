@@ -47,12 +47,27 @@ add_executable(reader
     ${SOURCE_DIR}/reader.cpp
 )
 
+# Market maker simulator executable
+add_executable(market_maker_sim
+    ${SOURCE_DIR}/market_maker_sim.cpp
+    ${SOURCE_DIR}/market_maker.cpp
+)
+
 target_include_directories(reader PRIVATE
     ${SOURCE_DIR}
     ${LIBPCAP_INCLUDE_DIRS}
 )
 
 target_link_libraries(reader
+    ${LIBPCAP_LIBRARIES}
+)
+
+target_include_directories(market_maker_sim PRIVATE
+    ${SOURCE_DIR}
+    ${LIBPCAP_INCLUDE_DIRS}
+)
+
+target_link_libraries(market_maker_sim
     ${LIBPCAP_LIBRARIES}
 )
 
@@ -179,6 +194,6 @@ set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Install targets
-install(TARGETS reader visualizer visualizer_pcap
+install(TARGETS reader visualizer visualizer_pcap market_maker_sim
     RUNTIME DESTINATION bin
 )

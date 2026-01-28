@@ -115,6 +115,22 @@ private:
   size_t max_markers = 50;             // Keep last 50 trades visible
   float marker_fade_time_ms = 2000.0f; // Fade out over 2 seconds
 
+  // Toxicity over time tracking
+  struct ToxicityTimePoint {
+    std::chrono::steady_clock::time_point timestamp;
+    double toxicity;
+    double price;
+    char side;
+  };
+  std::vector<ToxicityTimePoint> toxicity_history;
+  std::mutex toxicity_history_mutex;
+  size_t max_toxicity_history = 10000; // Keep last 10k points
+  std::chrono::steady_clock::time_point start_time;
+  bool start_time_set = false;
+  std::chrono::steady_clock::time_point last_toxicity_sample;
+  const int TOXICITY_SAMPLE_INTERVAL_MS =
+      50; // Sample every 50ms for smooth graph
+
 public:
   OrderBookVisualizer(OrderBook &ob) : order_book(ob), window(nullptr) {}
 
@@ -124,10 +140,13 @@ public:
   bool should_close();
   void render_controls();
   void render_order_book_graph();
+  void render_toxicity_over_time();
   void render_message_feed();
   void add_message(const std::string &text, bool is_buy, double price,
                    uint32_t volume, bool is_exec = false);
   void add_trade_marker(double price, uint32_t volume);
+  void record_toxicity_sample(double price, char side,
+                              bool force_sample = false);
   void apply_playback_to_index(size_t idx);
   void set_stream_finished(bool finished) { stream_finished = finished; }
   void process_playback();
@@ -315,12 +334,20 @@ void apply_batched_updates() {
       case UpdateType::ADD:
         order_book.add_order(update.order_id, update.price, update.volume,
                              update.side);
+        // Record toxicity sample
+        if (g_visualizer) {
+          g_visualizer->record_toxicity_sample(update.price, update.side);
+        }
         break;
       case UpdateType::MODIFY:
         order_book.modify_order(update.order_id, update.price, update.volume);
         break;
       case UpdateType::DELETE:
         order_book.delete_order(update.order_id);
+        // Record toxicity sample when order is cancelled
+        if (g_visualizer) {
+          g_visualizer->record_toxicity_sample(update.price, update.side);
+        }
         break;
       case UpdateType::EXECUTE:
         order_book.execute_order(update.order_id, update.volume, update.price);
@@ -329,6 +356,10 @@ void apply_batched_updates() {
         order_book.delete_order(update.order_id);
         order_book.add_order(update.new_order_id, update.price, update.volume,
                              update.side);
+        // Record toxicity sample
+        if (g_visualizer) {
+          g_visualizer->record_toxicity_sample(update.price, update.side);
+        }
         break;
       }
     }
@@ -552,10 +583,46 @@ void OrderBookVisualizer::render() {
   render_controls();
   ImGui::EndChild();
 
-  // Graph below
-  ImGui::BeginChild("Graph", ImVec2(0, 0), true);
+  // Order book graph (takes 70% of remaining space)
+  ImGui::BeginChild("OrderBookGraph",
+                    ImVec2(0, -ImGui::GetContentRegionAvail().y * 0.3f), true);
   render_order_book_graph();
   ImGui::EndChild();
+
+  // Toxicity over time graph (bottom 30%)
+  ImGui::BeginChild("ToxicityGraph", ImVec2(0, 0), true);
+  render_toxicity_over_time();
+  ImGui::EndChild();
+
+  // Periodically sample overall toxicity across all price levels
+  static auto last_overall_sample = std::chrono::steady_clock::now();
+  auto now = std::chrono::steady_clock::now();
+  auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                     now - last_overall_sample)
+                     .count();
+
+  if (elapsed >= 100) { // Sample every 100ms for overall view
+    // Sample average toxicity across all active price levels
+    auto bids = order_book.get_bids();
+    auto asks = order_book.get_asks();
+
+    if (!bids.empty() || !asks.empty()) {
+      // Sample a few representative price levels
+      int samples_taken = 0;
+      for (const auto &pair : bids) {
+        if (samples_taken++ >= 5)
+          break; // Sample top 5 bid levels
+        record_toxicity_sample(pair.first, 'B');
+      }
+      samples_taken = 0;
+      for (const auto &pair : asks) {
+        if (samples_taken++ >= 5)
+          break; // Sample top 5 ask levels
+        record_toxicity_sample(pair.first, 'S');
+      }
+    }
+    last_overall_sample = now;
+  }
 
   ImGui::EndChild();
 
@@ -596,6 +663,8 @@ void OrderBookVisualizer::process_playback() {
     case UpdateType::ADD:
       order_book.add_order(update.order_id, update.price, update.volume,
                            update.side);
+      // Record toxicity sample during playback
+      record_toxicity_sample(update.price, update.side);
       // Add to message feed
       {
         char msg[256];
@@ -610,6 +679,8 @@ void OrderBookVisualizer::process_playback() {
       break;
     case UpdateType::DELETE:
       order_book.delete_order(update.order_id);
+      // Record toxicity sample during playback
+      record_toxicity_sample(update.price, update.side);
       break;
     case UpdateType::EXECUTE:
       order_book.execute_order(update.order_id, update.volume, update.price);
@@ -627,6 +698,8 @@ void OrderBookVisualizer::process_playback() {
       order_book.delete_order(update.order_id);
       order_book.add_order(update.new_order_id, update.price, update.volume,
                            update.side);
+      // Record toxicity sample during playback
+      record_toxicity_sample(update.price, update.side);
       break;
     }
     playback_index++;
@@ -656,13 +729,42 @@ void OrderBookVisualizer::apply_playback_to_index(size_t idx) {
     std::lock_guard<std::mutex> lock(markers_mutex);
     trade_markers.clear();
   }
+  {
+    std::lock_guard<std::mutex> lock(toxicity_history_mutex);
+    toxicity_history.clear();
+    start_time_set = false;
+  }
 
   // Replay updates up to idx (without re-storing them)
+  // Reset start time for toxicity tracking
+  auto replay_start_time = std::chrono::steady_clock::now();
+  {
+    std::lock_guard<std::mutex> lock(toxicity_history_mutex);
+    start_time = replay_start_time;
+    start_time_set = true;
+    last_toxicity_sample = replay_start_time;
+  }
+
+  // Replay with simulated time progression for smooth graph
+  int sample_count = 0;
   for (const auto &update : snapshot) {
     switch (update.type) {
     case UpdateType::ADD:
       order_book.add_order(update.order_id, update.price, update.volume,
                            update.side);
+      // Record toxicity sample with simulated time progression
+      // Space samples out by TOXICITY_SAMPLE_INTERVAL_MS for smooth graph
+      if (sample_count % 2 ==
+          0) { // Sample every other update to avoid too many points
+        record_toxicity_sample(update.price, update.side, true);
+        // Manually advance the sample time to create progression
+        {
+          std::lock_guard<std::mutex> lock(toxicity_history_mutex);
+          last_toxicity_sample +=
+              std::chrono::milliseconds(TOXICITY_SAMPLE_INTERVAL_MS);
+        }
+      }
+      sample_count++;
       // Add to message feed
       {
         char msg[256];
@@ -677,6 +779,16 @@ void OrderBookVisualizer::apply_playback_to_index(size_t idx) {
       break;
     case UpdateType::DELETE:
       order_book.delete_order(update.order_id);
+      // Record toxicity sample with simulated time progression
+      if (sample_count % 2 == 0) {
+        record_toxicity_sample(update.price, update.side, true);
+        {
+          std::lock_guard<std::mutex> lock(toxicity_history_mutex);
+          last_toxicity_sample +=
+              std::chrono::milliseconds(TOXICITY_SAMPLE_INTERVAL_MS);
+        }
+      }
+      sample_count++;
       break;
     case UpdateType::EXECUTE:
       order_book.execute_order(update.order_id, update.volume, update.price);
@@ -692,6 +804,16 @@ void OrderBookVisualizer::apply_playback_to_index(size_t idx) {
       order_book.delete_order(update.order_id);
       order_book.add_order(update.new_order_id, update.price, update.volume,
                            update.side);
+      // Record toxicity sample with simulated time progression
+      if (sample_count % 2 == 0) {
+        record_toxicity_sample(update.price, update.side, true);
+        {
+          std::lock_guard<std::mutex> lock(toxicity_history_mutex);
+          last_toxicity_sample +=
+              std::chrono::milliseconds(TOXICITY_SAMPLE_INTERVAL_MS);
+        }
+      }
+      sample_count++;
       break;
     }
   }
@@ -732,6 +854,13 @@ void OrderBookVisualizer::render_controls() {
       // Clear order book
       order_book.clear();
 
+      // Clear toxicity history
+      {
+        std::lock_guard<std::mutex> lock(toxicity_history_mutex);
+        toxicity_history.clear();
+        start_time_set = false;
+      }
+
       // Clear message feed
       {
         std::lock_guard<std::mutex> lock(feed_mutex);
@@ -748,6 +877,13 @@ void OrderBookVisualizer::render_controls() {
       {
         std::lock_guard<std::mutex> lock(playback_mutex);
         playback_index = 0;
+      }
+
+      // Reset toxicity tracking for new playback
+      {
+        std::lock_guard<std::mutex> lock(toxicity_history_mutex);
+        toxicity_history.clear();
+        start_time_set = false;
       }
 
       // Start playback automatically
@@ -964,8 +1100,16 @@ void OrderBookVisualizer::render_order_book_graph() {
     ask_x = plot_pos.x + plot_size.x * 0.6f;
   }
 
-  // Draw simplified bid/ask lines (no gradient) -- build sorted point lists
-  std::vector<ImVec2> bid_points_unsorted;
+  // Draw simplified bid/ask lines with toxicity coloring
+  // Build sorted point lists with toxicity data and detailed metrics
+  struct PointWithToxicity {
+    ImVec2 pos;
+    double toxicity;
+    double price;
+    OrderBook::ToxicityMetrics metrics;
+  };
+
+  std::vector<PointWithToxicity> bid_points_with_toxicity;
   for (const auto &pair : bids) {
     double price = pair.first;
     uint32_t qty = pair.second;
@@ -976,29 +1120,63 @@ void OrderBookVisualizer::render_order_book_graph() {
         (float)((price - min_price) / (max_price - min_price)) * plot_size.x;
     float y =
         plot_pos.y + plot_size.y - (float)(qty / (double)max_qty) * plot_size.y;
-    bid_points_unsorted.emplace_back(x, y);
+    double toxicity = order_book.get_toxicity(price, 'B');
+    OrderBook::ToxicityMetrics metrics =
+        order_book.get_toxicity_metrics(price, 'B');
+    bid_points_with_toxicity.push_back(
+        {ImVec2(x, y), toxicity, price, metrics});
   }
 
   // Sort by x ascending so polyline goes left->center without crossing
-  std::sort(bid_points_unsorted.begin(), bid_points_unsorted.end(),
-            [](const ImVec2 &a, const ImVec2 &b) { return a.x < b.x; });
+  std::sort(bid_points_with_toxicity.begin(), bid_points_with_toxicity.end(),
+            [](const PointWithToxicity &a, const PointWithToxicity &b) {
+              return a.pos.x < b.pos.x;
+            });
 
   // Build final bid polyline starting at left baseline
   std::vector<ImVec2> bid_line_points;
   bid_line_points.emplace_back(plot_pos.x, plot_pos.y + plot_size.y);
-  for (const auto &p : bid_points_unsorted)
-    bid_line_points.push_back(p);
+  for (const auto &p : bid_points_with_toxicity)
+    bid_line_points.push_back(p.pos);
   // Ensure endpoint at best bid x (bottom)
   bid_line_points.emplace_back(bid_x, plot_pos.y + plot_size.y);
 
+  // Draw bid lines with toxicity-based color intensity and tooltips
   if (bid_line_points.size() >= 2) {
-    for (size_t i = 0; i + 1 < bid_line_points.size(); ++i)
+    for (size_t i = 0; i + 1 < bid_line_points.size(); ++i) {
+      // Get toxicity for this segment
+      double toxicity = 0.0;
+      PointWithToxicity *point_data = nullptr;
+      if (i > 0 && i - 1 < bid_points_with_toxicity.size()) {
+        point_data = &bid_points_with_toxicity[i - 1];
+        toxicity = point_data->toxicity;
+      }
+
+      // Color: Green (0,255,0) for low toxicity, Yellow (255,255,0) for medium,
+      // Red (255,0,0) for high Interpolate based on toxicity (0.0 = green, 1.0
+      // = red)
+      uint8_t r = (uint8_t)(toxicity * 255);
+      uint8_t g = (uint8_t)((1.0 - toxicity) * 255);
+      uint8_t b = 0;
+
       draw_list->AddLine(bid_line_points[i], bid_line_points[i + 1],
-                         IM_COL32(0, 200, 0, 255), 2.0f);
+                         IM_COL32(r, g, b, 255),
+                         3.0f); // Thicker line for visibility
+
+      // Add hover tooltip with detailed toxicity explanation
+      if (point_data && ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::Text("Price: $%.2f", point_data->price);
+        ImGui::Text("Toxicity: %.2f", point_data->toxicity);
+        ImGui::Separator();
+        ImGui::Text("%s", point_data->metrics.get_explanation().c_str());
+        ImGui::EndTooltip();
+      }
+    }
   }
 
   // Ask side: collect and sort by x descending so polyline goes right->center
-  std::vector<ImVec2> ask_points_unsorted;
+  std::vector<PointWithToxicity> ask_points_with_toxicity;
   for (const auto &pair : asks) {
     double price = pair.first;
     uint32_t qty = pair.second;
@@ -1009,23 +1187,57 @@ void OrderBookVisualizer::render_order_book_graph() {
         (float)((price - min_price) / (max_price - min_price)) * plot_size.x;
     float y =
         plot_pos.y + plot_size.y - (float)(qty / (double)max_qty) * plot_size.y;
-    ask_points_unsorted.emplace_back(x, y);
+    double toxicity = order_book.get_toxicity(price, 'S');
+    OrderBook::ToxicityMetrics metrics =
+        order_book.get_toxicity_metrics(price, 'S');
+    ask_points_with_toxicity.push_back(
+        {ImVec2(x, y), toxicity, price, metrics});
   }
 
-  std::sort(ask_points_unsorted.begin(), ask_points_unsorted.end(),
-            [](const ImVec2 &a, const ImVec2 &b) { return a.x > b.x; });
+  std::sort(ask_points_with_toxicity.begin(), ask_points_with_toxicity.end(),
+            [](const PointWithToxicity &a, const PointWithToxicity &b) {
+              return a.pos.x > b.pos.x;
+            });
 
   std::vector<ImVec2> ask_line_points;
   ask_line_points.emplace_back(plot_pos.x + plot_size.x,
                                plot_pos.y + plot_size.y);
-  for (const auto &p : ask_points_unsorted)
-    ask_line_points.push_back(p);
+  for (const auto &p : ask_points_with_toxicity)
+    ask_line_points.push_back(p.pos);
   ask_line_points.emplace_back(ask_x, plot_pos.y + plot_size.y);
 
+  // Draw ask lines with toxicity-based color intensity and tooltips
   if (ask_line_points.size() >= 2) {
-    for (size_t i = 0; i + 1 < ask_line_points.size(); ++i)
+    for (size_t i = 0; i + 1 < ask_line_points.size(); ++i) {
+      // Get toxicity for this segment
+      double toxicity = 0.0;
+      PointWithToxicity *point_data = nullptr;
+      if (i > 0 && i - 1 < ask_points_with_toxicity.size()) {
+        point_data = &ask_points_with_toxicity[i - 1];
+        toxicity = point_data->toxicity;
+      }
+
+      // Color: Red (255,0,0) for low toxicity, Yellow (255,255,0) for medium,
+      // Bright Red (255,100,100) for high Interpolate based on toxicity (0.0 =
+      // dark red, 1.0 = bright red/yellow)
+      uint8_t r = 255;
+      uint8_t g = (uint8_t)((1.0 - toxicity) * 100);
+      uint8_t b = (uint8_t)((1.0 - toxicity) * 100);
+
       draw_list->AddLine(ask_line_points[i], ask_line_points[i + 1],
-                         IM_COL32(200, 0, 0, 255), 2.0f);
+                         IM_COL32(r, g, b, 255),
+                         3.0f); // Thicker line for visibility
+
+      // Add hover tooltip with detailed toxicity explanation
+      if (point_data && ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::Text("Price: $%.2f", point_data->price);
+        ImGui::Text("Toxicity: %.2f", point_data->toxicity);
+        ImGui::Separator();
+        ImGui::Text("%s", point_data->metrics.get_explanation().c_str());
+        ImGui::EndTooltip();
+      }
+    }
   }
 
   // Draw opaque vertical lines to show spread
@@ -1118,6 +1330,251 @@ void OrderBookVisualizer::render_order_book_graph() {
       IM_COL32(255, 255, 255, 255), "Price");
   draw_list->AddText(ImVec2(plot_pos.x - 35, plot_pos.y + plot_size.y / 2 - 10),
                      IM_COL32(255, 255, 255, 255), "Qty");
+
+  // Draw toxicity legend with explanation
+  ImGui::SetCursorScreenPos(
+      ImVec2(plot_pos.x + plot_size.x - 200, plot_pos.y + 10));
+  ImGui::BeginGroup();
+  ImGui::Text("Toxicity Score:");
+  ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Green = Low (0.0)");
+  ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Yellow = Med (0.5)");
+  ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "Red = High (1.0)");
+  ImGui::Separator();
+  ImGui::Text("Factors:");
+  ImGui::BulletText("Cancel/Add ratio (40%%)");
+  ImGui::BulletText("Pings < 10 shares (20%%)");
+  ImGui::BulletText("Odd lots (15%%)");
+  ImGui::BulletText("High precision prices (15%%)");
+  ImGui::BulletText("Resistance levels (10%%)");
+  ImGui::Text("Hover over lines for details");
+  ImGui::EndGroup();
+}
+
+void OrderBookVisualizer::record_toxicity_sample(double price, char side,
+                                                 bool force_sample) {
+  auto now = std::chrono::steady_clock::now();
+
+  std::lock_guard<std::mutex> lock(toxicity_history_mutex);
+
+  if (!start_time_set) {
+    start_time = now;
+    last_toxicity_sample = now;
+    start_time_set = true;
+  }
+
+  // Only sample at regular intervals for smoother graph (skip during rapid
+  // updates) Unless force_sample is true (used during seek/replay)
+  if (!force_sample) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       now - last_toxicity_sample)
+                       .count();
+
+    if (elapsed < TOXICITY_SAMPLE_INTERVAL_MS) {
+      return; // Skip this sample, too soon
+    }
+  }
+
+  double toxicity = order_book.get_toxicity(price, side);
+
+  ToxicityTimePoint point;
+  point.timestamp = force_sample ? last_toxicity_sample : now;
+  point.toxicity = toxicity;
+  point.price = price;
+  point.side = side;
+
+  toxicity_history.push_back(point);
+
+  if (!force_sample) {
+    last_toxicity_sample = now;
+  }
+
+  // Limit history size
+  if (toxicity_history.size() > max_toxicity_history) {
+    toxicity_history.erase(toxicity_history.begin());
+  }
+}
+
+void OrderBookVisualizer::render_toxicity_over_time() {
+  ImDrawList *draw_list = ImGui::GetWindowDrawList();
+  ImVec2 graph_pos = ImGui::GetCursorScreenPos();
+  ImVec2 graph_size = ImGui::GetContentRegionAvail();
+
+  if (graph_size.y < 50)
+    return; // Too small to render
+
+  // Get toxicity history (thread-safe copy)
+  std::vector<ToxicityTimePoint> history;
+  {
+    std::lock_guard<std::mutex> lock(toxicity_history_mutex);
+    if (toxicity_history.empty()) {
+      ImGui::Text("No toxicity data yet - waiting for order book updates...");
+      return;
+    }
+    history = toxicity_history;
+  }
+
+  if (history.empty()) {
+    ImGui::Text("No toxicity data");
+    return;
+  }
+
+  // Calculate time range
+  auto now = std::chrono::steady_clock::now();
+  auto start = start_time_set ? start_time : history.front().timestamp;
+  auto total_duration =
+      std::chrono::duration_cast<std::chrono::milliseconds>(now - start)
+          .count();
+
+  if (total_duration == 0)
+    total_duration = 1;
+
+  // Add padding
+  float padding = 40.0f;
+  ImVec2 plot_pos(graph_pos.x + padding, graph_pos.y + padding);
+  ImVec2 plot_size(graph_size.x - padding * 2, graph_size.y - padding * 2);
+
+  // Draw axes
+  draw_list->AddLine(ImVec2(plot_pos.x, plot_pos.y + plot_size.y),
+                     ImVec2(plot_pos.x + plot_size.x, plot_pos.y + plot_size.y),
+                     IM_COL32(255, 255, 255, 255), 2.0f); // X-axis
+  draw_list->AddLine(ImVec2(plot_pos.x, plot_pos.y),
+                     ImVec2(plot_pos.x, plot_pos.y + plot_size.y),
+                     IM_COL32(255, 255, 255, 255), 2.0f); // Y-axis
+
+  // Draw title
+  ImGui::SetCursorScreenPos(ImVec2(plot_pos.x, graph_pos.y + 5));
+  ImGui::Text("Toxicity Over Time (Weighted Score)");
+
+  // Separate bid and ask history, sort by time
+  std::vector<std::pair<int64_t, double>> bid_history; // (time_ms, toxicity)
+  std::vector<std::pair<int64_t, double>> ask_history;
+
+  for (const auto &point : history) {
+    auto time_offset = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           point.timestamp - start)
+                           .count();
+
+    if (point.side == 'B') {
+      bid_history.emplace_back(time_offset, point.toxicity);
+    } else {
+      ask_history.emplace_back(time_offset, point.toxicity);
+    }
+  }
+
+  // Sort by time
+  std::sort(
+      bid_history.begin(), bid_history.end(),
+      [](const std::pair<int64_t, double> &a,
+         const std::pair<int64_t, double> &b) { return a.first < b.first; });
+  std::sort(
+      ask_history.begin(), ask_history.end(),
+      [](const std::pair<int64_t, double> &a,
+         const std::pair<int64_t, double> &b) { return a.first < b.first; });
+
+  // Create smoothed data by averaging nearby points (moving average)
+  auto smooth_data = [](const std::vector<std::pair<int64_t, double>> &data,
+                        int window_ms) {
+    if (data.empty())
+      return data;
+
+    std::vector<std::pair<int64_t, double>> smoothed;
+    for (size_t i = 0; i < data.size(); ++i) {
+      double sum = 0.0;
+      int count = 0;
+
+      // Average points within window
+      for (size_t j = 0; j < data.size(); ++j) {
+        int64_t time_diff = std::abs(data[i].first - data[j].first);
+        if (time_diff <= window_ms) {
+          sum += data[j].second;
+          count++;
+        }
+      }
+
+      if (count > 0) {
+        smoothed.emplace_back(data[i].first, sum / count);
+      }
+    }
+    return smoothed;
+  };
+
+  // Smooth the data (100ms window for smooth transitions)
+  auto bid_smoothed = smooth_data(bid_history, 100);
+  auto ask_smoothed = smooth_data(ask_history, 100);
+
+  // Draw bid line (green to red gradient)
+  if (bid_smoothed.size() >= 2) {
+    for (size_t i = 0; i + 1 < bid_smoothed.size(); ++i) {
+      float x1 =
+          plot_pos.x +
+          (float)(bid_smoothed[i].first / (double)total_duration) * plot_size.x;
+      float y1 = plot_pos.y + plot_size.y -
+                 (float)(bid_smoothed[i].second) * plot_size.y;
+      float x2 = plot_pos.x +
+                 (float)(bid_smoothed[i + 1].first / (double)total_duration) *
+                     plot_size.x;
+      float y2 = plot_pos.y + plot_size.y -
+                 (float)(bid_smoothed[i + 1].second) * plot_size.y;
+
+      // Color based on average toxicity of segment
+      double avg_toxicity =
+          (bid_smoothed[i].second + bid_smoothed[i + 1].second) / 2.0;
+      uint8_t r = (uint8_t)(avg_toxicity * 255);
+      uint8_t g = (uint8_t)((1.0 - avg_toxicity) * 255);
+      uint8_t b = 0;
+
+      draw_list->AddLine(ImVec2(x1, y1), ImVec2(x2, y2), IM_COL32(r, g, b, 255),
+                         2.5f);
+    }
+  }
+
+  // Draw ask line (red gradient)
+  if (ask_smoothed.size() >= 2) {
+    for (size_t i = 0; i + 1 < ask_smoothed.size(); ++i) {
+      float x1 =
+          plot_pos.x +
+          (float)(ask_smoothed[i].first / (double)total_duration) * plot_size.x;
+      float y1 = plot_pos.y + plot_size.y -
+                 (float)(ask_smoothed[i].second) * plot_size.y;
+      float x2 = plot_pos.x +
+                 (float)(ask_smoothed[i + 1].first / (double)total_duration) *
+                     plot_size.x;
+      float y2 = plot_pos.y + plot_size.y -
+                 (float)(ask_smoothed[i + 1].second) * plot_size.y;
+
+      // Color based on average toxicity of segment
+      double avg_toxicity =
+          (ask_smoothed[i].second + ask_smoothed[i + 1].second) / 2.0;
+      uint8_t r = 255;
+      uint8_t g = (uint8_t)((1.0 - avg_toxicity) * 100);
+      uint8_t b = (uint8_t)((1.0 - avg_toxicity) * 100);
+
+      draw_list->AddLine(ImVec2(x1, y1), ImVec2(x2, y2), IM_COL32(r, g, b, 255),
+                         2.5f);
+    }
+  }
+
+  // Draw Y-axis labels (toxicity 0.0 to 1.0)
+  for (int i = 0; i <= 5; i++) {
+    float y_val = i / 5.0f;
+    float y = plot_pos.y + plot_size.y - (y_val * plot_size.y);
+    char label[32];
+    snprintf(label, sizeof(label), "%.1f", y_val);
+    draw_list->AddText(ImVec2(plot_pos.x - 35, y - 8),
+                       IM_COL32(255, 255, 255, 255), label);
+  }
+
+  // Draw X-axis label
+  draw_list->AddText(
+      ImVec2(plot_pos.x + plot_size.x / 2 - 30, plot_pos.y + plot_size.y + 20),
+      IM_COL32(255, 255, 255, 255), "Time");
+
+  // Draw legend
+  ImGui::SetCursorScreenPos(
+      ImVec2(plot_pos.x + plot_size.x - 150, plot_pos.y + 5));
+  ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Bids");
+  ImGui::SameLine();
+  ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "Asks");
 }
 
 void OrderBookVisualizer::cleanup() {

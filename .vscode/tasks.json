@@ -76,6 +76,53 @@
         "reveal": "always",
         "panel": "dedicated"
       }
+    },
+    {
+      "label": "build market_maker_sim",
+      "type": "shell",
+      "command": "cmake --build build --target market_maker_sim",
+      "group": "build",
+      "problemMatcher": [
+        "$gcc"
+      ],
+      "presentation": {
+        "reveal": "silent",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "run market maker (AAPL)",
+      "type": "shell",
+      "command": "${workspaceFolder}/build/market_maker_sim",
+      "args": [
+        "data/ny4-xnys-pillar-a-20230822T133000.pcap",
+        "data/symbol_nyse.txt",
+        "-t",
+        "AAPL"
+      ],
+      "group": "test",
+      "dependsOn": "build market_maker_sim",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
+      "label": "run market maker (all symbols)",
+      "type": "shell",
+      "command": "${workspaceFolder}/build/market_maker_sim",
+      "args": [
+        "data/ny4-xnys-pillar-a-20230822T133000.pcap",
+        "data/symbol_nyse.txt"
+      ],
+      "group": "test",
+      "dependsOn": "build market_maker_sim",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
     }
   ]
 }
