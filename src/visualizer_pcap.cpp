@@ -81,8 +81,82 @@ std::mutex queue_mutex;
 const size_t BATCH_SIZE =
     500; // Process updates in batches (increased for better throughput)
 
-// Playback storage (for replay after stream finishes)
-std::vector<OrderBookUpdate> playback_updates;
+// Ring buffer for bounded playback storage
+template <typename T> class RingBuffer {
+public:
+  explicit RingBuffer(size_t capacity) : capacity_(capacity), data_(capacity) {}
+
+  void push_back(const T &item) {
+    if (size_ < capacity_) {
+      data_[write_pos_] = item;
+      write_pos_ = (write_pos_ + 1) % capacity_;
+      size_++;
+    } else {
+      // Overwrite oldest element
+      data_[write_pos_] = item;
+      write_pos_ = (write_pos_ + 1) % capacity_;
+      read_pos_ = (read_pos_ + 1) % capacity_;
+    }
+  }
+
+  [[nodiscard]] const T &operator[](size_t index) const {
+    return data_[(read_pos_ + index) % capacity_];
+  }
+
+  [[nodiscard]] T &operator[](size_t index) {
+    return data_[(read_pos_ + index) % capacity_];
+  }
+
+  [[nodiscard]] size_t size() const { return size_; }
+  [[nodiscard]] bool empty() const { return size_ == 0; }
+  [[nodiscard]] size_t capacity() const { return capacity_; }
+
+  void clear() {
+    size_ = 0;
+    read_pos_ = 0;
+    write_pos_ = 0;
+  }
+
+  // Iterator support for range-based for loops
+  class Iterator {
+  public:
+    Iterator(RingBuffer *buf, size_t pos) : buf_(buf), pos_(pos) {}
+    T &operator*() { return (*buf_)[pos_]; }
+    Iterator &operator++() {
+      ++pos_;
+      return *this;
+    }
+    bool operator!=(const Iterator &other) const { return pos_ != other.pos_; }
+
+  private:
+    RingBuffer *buf_;
+    size_t pos_;
+  };
+
+  Iterator begin() { return Iterator(this, 0); }
+  Iterator end() { return Iterator(this, size_); }
+
+private:
+  size_t capacity_;
+  std::vector<T> data_;
+  size_t read_pos_ = 0;
+  size_t write_pos_ = 0;
+  size_t size_ = 0;
+};
+
+// Checkpoint for fast seek operations
+struct OrderBookCheckpoint {
+  size_t update_index; // Index in playback buffer where this checkpoint was taken
+  std::map<double, uint32_t, std::greater<double>> bids_snapshot;
+  std::map<double, uint32_t, std::less<double>> asks_snapshot;
+  std::unordered_map<uint64_t, Order> active_orders_snapshot;
+};
+
+// Playback storage with bounded capacity and checkpointing
+constexpr size_t MAX_PLAYBACK_UPDATES = 500000; // ~500K updates max
+constexpr size_t CHECKPOINT_INTERVAL = 10000;   // Checkpoint every 10K updates
+RingBuffer<OrderBookUpdate> playback_buffer(MAX_PLAYBACK_UPDATES);
+std::vector<OrderBookCheckpoint> checkpoints;
 std::mutex playback_mutex;
 size_t playback_index = 0;
 
@@ -97,7 +171,10 @@ private:
   SDL_Window *window;
   SDL_GLContext gl_context;
   bool auto_scale = true;
+  bool lock_range = false;  // Lock the price range to prevent shifting
   float price_range = 5.0f;
+  double locked_min_price = 0.0;
+  double locked_max_price = 0.0;
   ImVec4 bid_color = ImVec4(0.0f, 1.0f, 0.0f, 0.5f);
   ImVec4 ask_color = ImVec4(1.0f, 0.0f, 0.0f, 0.5f);
   ImVec4 spread_color = ImVec4(1.0f, 1.0f, 0.0f, 1.0f);
@@ -306,6 +383,20 @@ void process_xdp_message(const uint8_t *data, size_t max_len,
   }
 }
 
+// Create a checkpoint of current order book state
+void create_checkpoint(size_t update_index) {
+  auto snapshot = order_book.get_atomic_snapshot();
+
+  OrderBookCheckpoint checkpoint;
+  checkpoint.update_index = update_index;
+  checkpoint.bids_snapshot = snapshot.bids;
+  checkpoint.asks_snapshot = snapshot.asks;
+  checkpoint.active_orders_snapshot = snapshot.active_orders;
+
+  std::lock_guard<std::mutex> lock(playback_mutex);
+  checkpoints.push_back(std::move(checkpoint));
+}
+
 // Apply batched updates to order book (optimized for high throughput)
 void apply_batched_updates() {
   std::vector<OrderBookUpdate> batch;
@@ -328,10 +419,22 @@ void apply_batched_updates() {
   // mutex)
   if (!batch.empty()) {
     for (const auto &update : batch) {
-      // Always store updates for playback so we can replay later
+      size_t current_index = 0;
+      // Store update in ring buffer for playback
       {
         std::lock_guard<std::mutex> lock(playback_mutex);
-        playback_updates.push_back(update);
+        playback_buffer.push_back(update);
+        current_index = playback_buffer.size();
+
+        // Create checkpoint at regular intervals
+        if (current_index > 0 && current_index % CHECKPOINT_INTERVAL == 0) {
+          // Release lock before creating checkpoint (checkpoint acquires its own lock)
+        }
+      }
+
+      // Create checkpoint outside of playback_mutex to avoid deadlock
+      if (current_index > 0 && current_index % CHECKPOINT_INTERVAL == 0) {
+        create_checkpoint(current_index);
       }
 
       // Apply update
@@ -645,8 +748,13 @@ void OrderBookVisualizer::process_playback() {
   if (!is_playing || !stream_finished)
     return;
 
-  std::lock_guard<std::mutex> lock(playback_mutex);
-  if (playback_updates.empty() || playback_index >= playback_updates.size()) {
+  size_t buffer_size = 0;
+  {
+    std::lock_guard<std::mutex> lock(playback_mutex);
+    buffer_size = playback_buffer.size();
+  }
+
+  if (buffer_size == 0 || playback_index >= buffer_size) {
     is_playing = false; // Reached end
     playback_index = 0; // Reset for next play
     return;
@@ -662,8 +770,16 @@ void OrderBookVisualizer::process_playback() {
   int delay_ms = (int)(20.0f / playback_speed);
 
   if (elapsed >= delay_ms) {
-    // Apply next update
-    const auto &update = playback_updates[playback_index];
+    // Get the update to apply
+    OrderBookUpdate update;
+    {
+      std::lock_guard<std::mutex> lock(playback_mutex);
+      if (playback_index >= playback_buffer.size())
+        return;
+      update = playback_buffer[playback_index];
+    }
+
+    // Apply update
     switch (update.type) {
     case UpdateType::ADD:
       order_book.add_order(update.order_id, update.price, update.volume,
@@ -707,25 +823,36 @@ void OrderBookVisualizer::process_playback() {
       record_toxicity_sample(update.price, update.side);
       break;
     }
-    playback_index++;
+
+    {
+      std::lock_guard<std::mutex> lock(playback_mutex);
+      playback_index++;
+    }
     last_playback_time = now;
   }
 }
 
 void OrderBookVisualizer::apply_playback_to_index(size_t idx) {
-  // Apply stored updates from 0..idx-1 to rebuild order book state
-  std::vector<OrderBookUpdate> snapshot;
+  // Find the nearest checkpoint before the target index for fast seeking
+  size_t start_from = 0;
+  const OrderBookCheckpoint *nearest_checkpoint = nullptr;
+
   {
     std::lock_guard<std::mutex> lock(playback_mutex);
-    if (idx > playback_updates.size())
-      idx = playback_updates.size();
-    snapshot.reserve(idx);
-    for (size_t i = 0; i < idx; ++i)
-      snapshot.push_back(playback_updates[i]);
+    if (idx > playback_buffer.size())
+      idx = playback_buffer.size();
+
+    // Find nearest checkpoint before target index
+    for (auto it = checkpoints.rbegin(); it != checkpoints.rend(); ++it) {
+      if (it->update_index <= idx) {
+        nearest_checkpoint = &(*it);
+        start_from = it->update_index;
+        break;
+      }
+    }
   }
 
-  // Clear current state
-  order_book.clear();
+  // Clear UI state
   {
     std::lock_guard<std::mutex> lock(feed_mutex);
     message_feed.clear();
@@ -740,7 +867,26 @@ void OrderBookVisualizer::apply_playback_to_index(size_t idx) {
     start_time_set = false;
   }
 
-  // Replay updates up to idx (without re-storing them)
+  // Restore from checkpoint or clear order book
+  if (nearest_checkpoint) {
+    order_book.restore_from_snapshot(nearest_checkpoint->bids_snapshot,
+                                     nearest_checkpoint->asks_snapshot,
+                                     nearest_checkpoint->active_orders_snapshot);
+  } else {
+    order_book.clear();
+    start_from = 0;
+  }
+
+  // Collect updates to replay from checkpoint to target
+  std::vector<OrderBookUpdate> updates_to_replay;
+  {
+    std::lock_guard<std::mutex> lock(playback_mutex);
+    updates_to_replay.reserve(idx - start_from);
+    for (size_t i = start_from; i < idx; ++i) {
+      updates_to_replay.push_back(playback_buffer[i]);
+    }
+  }
+
   // Reset start time for toxicity tracking
   auto replay_start_time = std::chrono::steady_clock::now();
   {
@@ -750,19 +896,15 @@ void OrderBookVisualizer::apply_playback_to_index(size_t idx) {
     last_toxicity_sample = replay_start_time;
   }
 
-  // Replay with simulated time progression for smooth graph
+  // Replay updates from checkpoint to target (much faster than from beginning)
   int sample_count = 0;
-  for (const auto &update : snapshot) {
+  for (const auto &update : updates_to_replay) {
     switch (update.type) {
     case UpdateType::ADD:
       order_book.add_order(update.order_id, update.price, update.volume,
                            update.side);
-      // Record toxicity sample with simulated time progression
-      // Space samples out by TOXICITY_SAMPLE_INTERVAL_MS for smooth graph
-      if (sample_count % 2 ==
-          0) { // Sample every other update to avoid too many points
+      if (sample_count % 10 == 0) { // Sample every 10th update during replay
         record_toxicity_sample(update.price, update.side, true);
-        // Manually advance the sample time to create progression
         {
           std::lock_guard<std::mutex> lock(toxicity_history_mutex);
           last_toxicity_sample +=
@@ -770,22 +912,13 @@ void OrderBookVisualizer::apply_playback_to_index(size_t idx) {
         }
       }
       sample_count++;
-      // Add to message feed
-      {
-        char msg[256];
-        snprintf(msg, sizeof(msg), "ADD %s $%.2f x %u",
-                 update.side == 'B' ? "BUY" : "SELL", update.price,
-                 update.volume);
-        add_message(msg, update.side == 'B', update.price, update.volume);
-      }
       break;
     case UpdateType::MODIFY:
       order_book.modify_order(update.order_id, update.price, update.volume);
       break;
     case UpdateType::DELETE:
       order_book.delete_order(update.order_id);
-      // Record toxicity sample with simulated time progression
-      if (sample_count % 2 == 0) {
+      if (sample_count % 10 == 0) {
         record_toxicity_sample(update.price, update.side, true);
         {
           std::lock_guard<std::mutex> lock(toxicity_history_mutex);
@@ -797,20 +930,12 @@ void OrderBookVisualizer::apply_playback_to_index(size_t idx) {
       break;
     case UpdateType::EXECUTE:
       order_book.execute_order(update.order_id, update.volume, update.price);
-      {
-        char msg[256];
-        snprintf(msg, sizeof(msg), "EXEC $%.2f x %u", update.price,
-                 update.volume);
-        add_message(msg, true, update.price, update.volume, true);
-      }
-      add_trade_marker(update.price, update.volume);
       break;
     case UpdateType::REPLACE:
       order_book.delete_order(update.order_id);
       order_book.add_order(update.new_order_id, update.price, update.volume,
                            update.side);
-      // Record toxicity sample with simulated time progression
-      if (sample_count % 2 == 0) {
+      if (sample_count % 10 == 0) {
         record_toxicity_sample(update.price, update.side, true);
         {
           std::lock_guard<std::mutex> lock(toxicity_history_mutex);
@@ -823,7 +948,7 @@ void OrderBookVisualizer::apply_playback_to_index(size_t idx) {
     }
   }
 
-  // Update playback index to reflect new position
+  // Update playback index
   {
     std::lock_guard<std::mutex> lock(playback_mutex);
     playback_index = idx;
@@ -838,6 +963,31 @@ void OrderBookVisualizer::render_controls() {
     ImGui::SameLine();
     ImGui::SliderFloat("Price Range", &price_range, 0.1f, 20.0f);
   }
+  ImGui::SameLine();
+  if (ImGui::Checkbox("Lock Range", &lock_range)) {
+    if (lock_range) {
+      // Capture current price range when locking
+      auto stats = order_book.get_stats();
+      double mid_price = stats.mid_price > 0 ? stats.mid_price :
+        (stats.best_bid > 0 && stats.best_ask > 0 ? (stats.best_bid + stats.best_ask) / 2.0 :
+         (stats.best_bid > 0 ? stats.best_bid : stats.best_ask));
+
+      if (auto_scale) {
+        double price_span = 0.0;
+        if (stats.best_bid > 0 && stats.best_ask > 0) {
+          double spread = stats.best_ask - stats.best_bid;
+          price_span = std::max(spread * 10.0, mid_price * 0.02);
+        } else {
+          price_span = mid_price * 0.05;
+        }
+        locked_min_price = mid_price - price_span;
+        locked_max_price = mid_price + price_span;
+      } else {
+        locked_min_price = mid_price - price_range;
+        locked_max_price = mid_price + price_range;
+      }
+    }
+  }
 
   ImGui::SameLine();
   if (stream_finished) {
@@ -846,7 +996,7 @@ void OrderBookVisualizer::render_controls() {
       if (is_playing) {
         last_playback_time = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> lock(playback_mutex);
-        if (playback_index >= playback_updates.size()) {
+        if (playback_index >= playback_buffer.size()) {
           playback_index = 0; // Reset to beginning
         }
       }
@@ -884,43 +1034,52 @@ void OrderBookVisualizer::render_controls() {
         playback_index = 0;
       }
 
-      // Reset toxicity tracking for new playback
-      {
-        std::lock_guard<std::mutex> lock(toxicity_history_mutex);
-        toxicity_history.clear();
-        start_time_set = false;
-      }
-
       // Start playback automatically
       is_playing = true;
       last_playback_time = std::chrono::steady_clock::now();
     }
-    // Timeline slider / seek
+
+    // Timeline slider / seek - only apply seek on mouse release
     size_t playback_size = 0;
     {
       std::lock_guard<std::mutex> lock(playback_mutex);
-      playback_size = playback_updates.size();
+      playback_size = playback_buffer.size();
     }
 
     if (playback_size > 0) {
       ImGui::SameLine();
       static int seek_idx = 0;
+      static int prev_seek_idx = 0;
       int max_idx = (int)playback_size;
+
+      // Update current position if playing
+      if (is_playing) {
+        std::lock_guard<std::mutex> lock(playback_mutex);
+        seek_idx = (int)playback_index;
+        prev_seek_idx = seek_idx;
+      }
+
       if (ImGui::SliderInt("Position", &seek_idx, 0, max_idx)) {
         // Clamp
         if (seek_idx < 0)
           seek_idx = 0;
         if (seek_idx > max_idx)
           seek_idx = max_idx;
-        apply_playback_to_index((size_t)seek_idx);
+
+        // Only apply seek if mouse was released (slider changed and no longer active)
+        if (!ImGui::IsItemActive() && seek_idx != prev_seek_idx) {
+          apply_playback_to_index((size_t)seek_idx);
+          prev_seek_idx = seek_idx;
+        }
       }
     }
+
     if (is_playing) {
       ImGui::SameLine();
       ImGui::SliderFloat("Speed", &playback_speed, 0.1f, 5.0f);
       std::lock_guard<std::mutex> lock(playback_mutex);
       ImGui::SameLine();
-      ImGui::Text("(%zu/%zu)", playback_index, playback_updates.size());
+      ImGui::Text("(%zu/%zu)", playback_index, playback_buffer.size());
     }
   } else {
     ImGui::Text("Streaming...");
@@ -1041,7 +1200,11 @@ void OrderBookVisualizer::render_order_book_graph() {
                                 ? (best_bid + best_ask) / 2.0
                                 : (best_bid > 0 ? best_bid : best_ask));
 
-  if (auto_scale) {
+  if (lock_range && locked_min_price != 0.0 && locked_max_price != 0.0) {
+    // Use locked price range - prevents window from shifting
+    min_price = locked_min_price;
+    max_price = locked_max_price;
+  } else if (auto_scale) {
     double price_span = 0.0;
     if (best_bid > 0 && best_ask > 0) {
       double spread = best_ask - best_bid;

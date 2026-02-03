@@ -250,4 +250,32 @@ void MarketMakerStrategy::reset() {
   our_order_ids_.clear();
   stats_ = MarketMakerStats();
   stats_.start_time = std::chrono::steady_clock::now();
+  toxicity_window_ = ToxicityWindow();
+  toxicity_window_.start_time = std::chrono::steady_clock::now();
+}
+
+double MarketMakerStrategy::sigmoid(double x) const noexcept {
+  return 1.0 / (1.0 + std::exp(-x));
+}
+
+double MarketMakerStrategy::calculate_toxicity_score(double cancel_rate, double obi, double short_vol) const noexcept {
+  // Equation (8) from strategy proposal
+  // p_toxic = σ(α1 · r_cancel + α2 · |OBI| + α3 · σ_short)
+  double score = alpha1_ * cancel_rate + alpha2_ * std::abs(obi) + alpha3_ * short_vol;
+  return sigmoid(score);
+}
+
+double MarketMakerStrategy::calculate_expected_pnl(double spread, double toxicity, double inventory_risk) const noexcept {
+  // Equation (14) from strategy proposal
+  // E[PnL] = P(fill) · (s/2 - p_toxic · μ_a) - γI²
+  double half_spread_capture = spread / 2.0;
+  double expected_adverse = toxicity * mu_adverse_;
+  double expected_pnl = fill_probability_ * (half_spread_capture - expected_adverse) - inventory_risk;
+  return expected_pnl;
+}
+
+bool MarketMakerStrategy::should_quote(double expected_pnl) const noexcept {
+  // Equation (15) from strategy proposal
+  // Quote only if E[PnL] > 0 and |I| < I_max
+  return expected_pnl > 0.0 && std::abs(inventory_) < max_position_;
 }

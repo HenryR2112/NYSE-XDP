@@ -18,6 +18,13 @@ struct MarketMakerStats {
   double max_inventory = 0.0;
   double min_inventory = 0.0;
   std::chrono::steady_clock::time_point start_time;
+
+  // Strategy proposal metrics
+  double sharpe_ratio = 0.0;
+  double inventory_variance = 0.0;
+  int64_t quotes_suppressed = 0;  // Quotes suppressed due to toxicity
+  int64_t adverse_fills = 0;       // Fills followed by adverse price movement
+  double avg_toxicity = 0.0;
 };
 
 struct MarketMakerQuote {
@@ -64,6 +71,11 @@ public:
   // Reset strategy state
   void reset();
 
+  // Strategy proposal methods
+  [[nodiscard]] double calculate_toxicity_score(double cancel_rate, double obi, double short_vol) const noexcept;
+  [[nodiscard]] double calculate_expected_pnl(double spread, double toxicity, double inventory_risk) const noexcept;
+  [[nodiscard]] bool should_quote(double expected_pnl) const noexcept;
+
 private:
   OrderBook &order_book_;
   bool use_toxicity_screen_;
@@ -91,8 +103,28 @@ private:
 
   MarketMakerStats stats_;
 
+  // Strategy proposal parameters (from PDF)
+  double alpha1_ = 1.5;  // Cancel rate weight
+  double alpha2_ = 1.0;  // OBI weight
+  double alpha3_ = 0.5;  // Short volatility weight
+  double mu_adverse_ = 0.005;  // Expected adverse price movement (~s/2)
+  double gamma_risk_ = 0.001;  // Inventory risk penalty coefficient
+  double fill_probability_ = 0.15;  // Baseline fill probability
+
+  // Rolling window for toxicity metrics
+  struct ToxicityWindow {
+    std::chrono::steady_clock::time_point start_time;
+    uint32_t cancel_count = 0;
+    uint32_t add_count = 0;
+    double sum_price_changes = 0.0;
+    int num_price_samples = 0;
+  };
+  mutable ToxicityWindow toxicity_window_;
+  double window_duration_ms_ = 1000.0;  // 1 second rolling window
+
   // Helper methods
   [[nodiscard]] double round_to_tick(double price) const noexcept;
   [[nodiscard]] double calculate_toxicity_adjusted_spread(double base_spread_val) const;
   [[nodiscard]] double calculate_inventory_skew() const noexcept;
+  [[nodiscard]] double sigmoid(double x) const noexcept;
 };

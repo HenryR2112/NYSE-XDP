@@ -213,6 +213,42 @@ public:
     update_stats();
   }
 
+  // Atomic snapshot - captures all state in a single lock acquisition for consistent rendering
+  struct AtomicSnapshot {
+    BookStats stats;
+    std::map<double, uint32_t, std::greater<double>> bids;
+    std::map<double, uint32_t, std::less<double>> asks;
+    std::unordered_map<uint64_t, Order> active_orders;
+    double last_traded_price;
+    uint32_t last_traded_volume;
+  };
+
+  [[nodiscard]] AtomicSnapshot get_atomic_snapshot() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    AtomicSnapshot snapshot;
+    snapshot.stats = stats_;
+    snapshot.bids = bids_;
+    snapshot.asks = asks_;
+    snapshot.active_orders = active_orders_;
+    snapshot.last_traded_price = last_traded_price_;
+    snapshot.last_traded_volume = last_traded_volume_;
+    return snapshot;
+  }
+
+  // Restore order book state from a snapshot (for checkpoint-based seeking)
+  void restore_from_snapshot(const std::map<double, uint32_t, std::greater<double>> &bids,
+                             const std::map<double, uint32_t, std::less<double>> &asks,
+                             const std::unordered_map<uint64_t, Order> &active_orders) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    bids_ = bids;
+    asks_ = asks;
+    active_orders_ = active_orders;
+    // Clear toxicity metrics since we're restoring from checkpoint
+    bid_toxicity_.clear();
+    ask_toxicity_.clear();
+    update_stats();
+  }
+
   // Thread-safe getters that return copies (snapshots) to avoid race conditions
   [[nodiscard]] BookStats get_stats() const {
     std::lock_guard<std::mutex> lock(mtx_);
