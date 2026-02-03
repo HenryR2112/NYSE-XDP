@@ -1,12 +1,14 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.14)
 project(NYSE_XDP_Parser VERSION 1.0.0 LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Build configuration
-set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type: Debug or Release")
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type: Debug or Release" FORCE)
+endif()
 set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release)
 
 # Find required libraries
@@ -41,6 +43,17 @@ endif()
 
 # Source directory
 set(SOURCE_DIR ${CMAKE_SOURCE_DIR}/src)
+set(COMMON_DIR ${SOURCE_DIR}/common)
+
+# Common library sources
+set(COMMON_SOURCES
+    ${COMMON_DIR}/symbol_map.cpp
+)
+
+# Common library (header-only + symbol_map implementation)
+add_library(xdp_common STATIC ${COMMON_SOURCES})
+target_include_directories(xdp_common PUBLIC ${SOURCE_DIR})
+target_compile_options(xdp_common PRIVATE -Wall -Wextra -Wpedantic)
 
 # Main parser executable
 add_executable(reader
@@ -58,7 +71,8 @@ target_include_directories(reader PRIVATE
     ${LIBPCAP_INCLUDE_DIRS}
 )
 
-target_link_libraries(reader
+target_link_libraries(reader PRIVATE
+    xdp_common
     ${LIBPCAP_LIBRARIES}
 )
 
@@ -67,12 +81,19 @@ target_include_directories(market_maker_sim PRIVATE
     ${LIBPCAP_INCLUDE_DIRS}
 )
 
-target_link_libraries(market_maker_sim
+target_link_libraries(market_maker_sim PRIVATE
+    xdp_common
     ${LIBPCAP_LIBRARIES}
 )
 
 # Compiler flags
 target_compile_options(reader PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+)
+
+target_compile_options(market_maker_sim PRIVATE
     -Wall
     -Wextra
     -Wpedantic
@@ -105,7 +126,7 @@ if(NOT SDL2_FOUND)
 endif()
 
 # ImGui source files
-set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/thirdparty/imgui)
+set(IMGUI_DIR ${SOURCE_DIR}/thirdparty/imgui)
 set(IMGUI_SOURCES
     ${IMGUI_DIR}/imgui.cpp
     ${IMGUI_DIR}/imgui_demo.cpp
@@ -151,6 +172,7 @@ target_include_directories(visualizer_pcap PRIVATE
 )
 
 target_link_libraries(visualizer_pcap PRIVATE
+    xdp_common
     ${SDL2_LIBRARIES}
     ${LIBPCAP_LIBRARIES}
 )

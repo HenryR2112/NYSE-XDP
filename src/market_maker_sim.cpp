@@ -1,113 +1,53 @@
+// market_maker_sim.cpp - Market Maker Simulation with PCAP playback
+// Simulates market making strategies on historical XDP data
+
+#include "common/pcap_reader.hpp"
+#include "common/symbol_map.hpp"
+#include "common/xdp_types.hpp"
+#include "common/xdp_utils.hpp"
 #include "market_maker.hpp"
 #include "order_book.hpp"
+
 #include <algorithm>
-#include <arpa/inet.h>
 #include <cmath>
-#include <cstring>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <pcap.h>
-#include <sstream>
+#include <limits>
+#include <random>
 #include <unordered_map>
 #include <vector>
 
-std::unordered_map<uint32_t, std::string> symbol_map;
-std::string filter_ticker = "";
+namespace {
 
-uint16_t read_le16(const uint8_t *p) { return p[0] | (p[1] << 8); }
-uint32_t read_le32(const uint8_t *p) {
-  return p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
-}
-uint64_t read_le64(const uint8_t *p) {
-  return (uint64_t)p[0] | ((uint64_t)p[1] << 8) | ((uint64_t)p[2] << 16) |
-         ((uint64_t)p[3] << 24) | ((uint64_t)p[4] << 32) |
-         ((uint64_t)p[5] << 40) | ((uint64_t)p[6] << 48) |
-         ((uint64_t)p[7] << 56);
-}
+std::string g_filter_ticker;
 
-double parse_price(uint32_t price_raw) {
-  // NYSE XDP prices are typically in ten-thousandths (1/10000) of a dollar.
-  // Some captures/sources appear to be scaled 100x higher; apply a safe
-  // heuristic so equities like AAPL don't show up as $17,000+.
-  double p = static_cast<double>(price_raw) / 10000.0;
-  if (p > 10000.0) {
-    p = static_cast<double>(price_raw) / 1000000.0;
-  }
-  return p;
-}
+struct ExecutionModelConfig {
+  uint64_t seed = 1;
+  double latency_ms_mean = 0.0;
+  double latency_ms_jitter = 0.0;
+  uint32_t queue_ahead_mean = 0;
+  double queue_ahead_cv = 0.0;
+  double miss_prob = 0.0;
+  double fee_per_share = 0.0;
+  enum class FillMode { Cross, Match } fill_mode = FillMode::Cross;
+  uint64_t quote_interval_ns = 0;
+};
 
-static uint32_t read_symbol_index(uint16_t msg_type, const uint8_t *data,
-                                  size_t max_len) {
-  // Handle messages with non-standard header structure (106, 223)
-  if (msg_type == 106 || msg_type == 223) {
-    // Messages 106 and 223: SourceTime@4, SourceTimeNS@8, SymbolIndex@12
-    if (max_len < 16)
-      return 0;
-    return read_le32(data + 12);
-  }
+ExecutionModelConfig g_exec;
 
-  // Standard messages: SourceTimeNS@4, SymbolIndex@8
-  if (max_len < 12)
-    return 0;
-  return read_le32(data + 8);
-}
+struct VirtualOrder {
+  double price = 0.0;
+  uint32_t size = 0;
+  uint32_t remaining = 0;
+  uint64_t active_at_ns = 0;
+  uint32_t queue_ahead = 0;
+  bool live = false;
+};
 
-std::string get_symbol(uint32_t symbol_index) {
-  auto it = symbol_map.find(symbol_index);
-  if (it != symbol_map.end()) {
-    return it->second;
-  }
-  return "UNKNOWN";
-}
-
-void load_symbol_map(const char *filename) {
-  std::ifstream file(filename);
-  if (!file.is_open()) {
-    std::cerr << "Warning: Could not open symbol file: " << filename
-              << std::endl;
-    return;
-  }
-
-  std::string line;
-  int count = 0;
-  while (std::getline(file, line)) {
-    if (line.empty())
-      continue;
-
-    if (!line.empty() && line.back() == '\r') {
-      line.pop_back();
-    }
-
-    while (!line.empty() && std::isspace(line.back())) {
-      line.pop_back();
-    }
-
-    if (line.empty())
-      continue;
-
-    std::vector<std::string> tokens;
-    std::string token;
-    std::istringstream iss(line);
-
-    while (std::getline(iss, token, '|')) {
-      tokens.push_back(token);
-    }
-
-    if (tokens.size() >= 3) {
-      try {
-        uint32_t index = std::stoul(tokens[2]);
-        std::string symbol = tokens[0];
-        symbol_map[index] = symbol;
-        count++;
-      } catch (const std::exception &e) {
-        continue;
-      }
-    }
-  }
-
-  std::cout << "Loaded " << symbol_map.size() << " symbols" << std::endl;
-}
+struct StrategyExecState {
+  VirtualOrder bid;
+  VirtualOrder ask;
+};
 
 struct PerSymbolSim {
   OrderBook order_book_baseline;
@@ -115,17 +55,110 @@ struct PerSymbolSim {
   MarketMakerStrategy mm_baseline;
   MarketMakerStrategy mm_toxicity;
 
-  // Exchange order_id -> resting side ('B'/'S') for that symbol
   std::unordered_map<uint64_t, char> order_side;
+
+  bool initialized = false;
+  uint32_t symbol_index = 0;
+  std::mt19937_64 rng;
+  std::normal_distribution<double> latency_ms_dist;
+  std::lognormal_distribution<double> queue_ahead_logn_dist;
+  std::uniform_real_distribution<double> uni01;
+
+  StrategyExecState baseline_state;
+  StrategyExecState toxicity_state;
+  uint64_t last_quote_update_ns = 0;
 
   PerSymbolSim()
       : order_book_baseline(), order_book_toxicity(),
         mm_baseline(order_book_baseline, false),
-        mm_toxicity(order_book_toxicity, true), order_side() {}
+        mm_toxicity(order_book_toxicity, true), order_side(),
+        latency_ms_dist(0.0, 1.0), queue_ahead_logn_dist(0.0, 1.0),
+        uni01(0.0, 1.0) {}
 
-  void update_quotes() {
+  void ensure_init(uint32_t idx) {
+    if (initialized)
+      return;
+    initialized = true;
+    symbol_index = idx;
+
+    const uint64_t seed =
+        g_exec.seed ^ (static_cast<uint64_t>(idx) * 0x9E3779B97F4A7C15ULL);
+    rng.seed(seed);
+
+    const double jitter = std::max(0.0, g_exec.latency_ms_jitter);
+    latency_ms_dist =
+        std::normal_distribution<double>(g_exec.latency_ms_mean, jitter);
+
+    const double m =
+        std::max(1.0, static_cast<double>(g_exec.queue_ahead_mean));
+    const double c = std::max(0.0, g_exec.queue_ahead_cv);
+    const double sigma2 = std::log(1.0 + c * c);
+    const double sigma = std::sqrt(sigma2);
+    const double mu = std::log(m) - 0.5 * sigma2;
+    queue_ahead_logn_dist = std::lognormal_distribution<double>(mu, sigma);
+
+    mm_baseline.set_fee_per_share(g_exec.fee_per_share);
+    mm_toxicity.set_fee_per_share(g_exec.fee_per_share);
+  }
+
+  uint64_t sample_latency_ns() {
+    double ms = latency_ms_dist(rng);
+    if (ms < 0.0)
+      ms = 0.0;
+    return static_cast<uint64_t>(ms * 1000000.0);
+  }
+
+  uint32_t sample_queue_ahead() {
+    double v = queue_ahead_logn_dist(rng);
+    if (v < 0.0)
+      v = 0.0;
+    if (v > static_cast<double>(std::numeric_limits<uint32_t>::max()))
+      v = static_cast<double>(std::numeric_limits<uint32_t>::max());
+    return static_cast<uint32_t>(v);
+  }
+
+  bool eligible_for_fill(double quote_px, double exec_px,
+                         bool is_bid_side) const {
+    if (g_exec.fill_mode == ExecutionModelConfig::FillMode::Match) {
+      return std::abs(quote_px - exec_px) < 1e-12;
+    }
+    return is_bid_side ? (quote_px >= exec_px) : (quote_px <= exec_px);
+  }
+
+  void update_virtual_order(VirtualOrder &vo, double price, uint32_t size,
+                            uint64_t now_ns) {
+    const bool changed = (!vo.live) || (vo.price != price) ||
+                         (vo.size != size) || (vo.remaining == 0);
+    if (!changed)
+      return;
+    vo.price = price;
+    vo.size = size;
+    vo.remaining = size;
+    vo.queue_ahead = sample_queue_ahead();
+    vo.active_at_ns = now_ns + sample_latency_ns();
+    vo.live = (price > 0.0 && size > 0);
+  }
+
+  void update_quotes(uint64_t now_ns) {
+    if (now_ns - last_quote_update_ns < g_exec.quote_interval_ns)
+      return;
+    last_quote_update_ns = now_ns;
+
     mm_baseline.update_market_data();
     mm_toxicity.update_market_data();
+
+    const MarketMakerQuote q_base = mm_baseline.get_current_quotes();
+    const MarketMakerQuote q_tox = mm_toxicity.get_current_quotes();
+
+    update_virtual_order(baseline_state.bid, q_base.bid_price, q_base.bid_size,
+                         now_ns);
+    update_virtual_order(baseline_state.ask, q_base.ask_price, q_base.ask_size,
+                         now_ns);
+
+    update_virtual_order(toxicity_state.bid, q_tox.bid_price, q_tox.bid_size,
+                         now_ns);
+    update_virtual_order(toxicity_state.ask, q_tox.ask_price, q_tox.ask_size,
+                         now_ns);
   }
 
   void on_add(uint64_t order_id, double price, uint32_t volume, char side) {
@@ -156,210 +189,150 @@ struct PerSymbolSim {
     order_book_toxicity.add_order(new_order_id, price, volume, side);
   }
 
-  void maybe_fill_on_execution(char resting_side, double exec_price,
-                               uint32_t exec_qty) {
-    // "Paper MM" fill model: if the execution price would have crossed our
-    // quoted price, count a fill (up to our quote size).
-    update_quotes();
+  void try_fill_one(MarketMakerStrategy &mm, StrategyExecState &st,
+                    bool is_bid_side, double exec_price, uint32_t exec_qty,
+                    uint64_t now_ns) {
+    VirtualOrder &vo = is_bid_side ? st.bid : st.ask;
+    if (!vo.live || vo.remaining == 0)
+      return;
+    if (now_ns < vo.active_at_ns)
+      return;
+    if (!eligible_for_fill(vo.price, exec_price, is_bid_side))
+      return;
 
-    const MarketMakerQuote q_base = mm_baseline.get_current_quotes();
-    const MarketMakerQuote q_tox = mm_toxicity.get_current_quotes();
+    uint32_t qty_left = exec_qty;
+    if (vo.queue_ahead > 0) {
+      const uint32_t consume = std::min(vo.queue_ahead, qty_left);
+      vo.queue_ahead -= consume;
+      qty_left -= consume;
+    }
+    if (qty_left == 0)
+      return;
+
+    const double u = uni01(rng);
+    if (u < std::max(0.0, std::min(1.0, g_exec.miss_prob)))
+      return;
+
+    const uint32_t fill_qty = std::min(vo.remaining, qty_left);
+    if (fill_qty == 0)
+      return;
+
+    vo.remaining -= fill_qty;
+    mm.on_order_filled(is_bid_side, vo.price, fill_qty);
+  }
+
+  void maybe_fill_on_execution(char resting_side, double exec_price,
+                               uint32_t exec_qty, uint64_t now_ns) {
+    update_quotes(now_ns);
 
     if (resting_side == 'B') {
-      if (q_base.bid_price > 0.0 && q_base.bid_size > 0 &&
-          q_base.bid_price >= exec_price) {
-        mm_baseline.on_order_filled(true, exec_price,
-                                    std::min(exec_qty, q_base.bid_size));
-      }
-      if (q_tox.bid_price > 0.0 && q_tox.bid_size > 0 &&
-          q_tox.bid_price >= exec_price) {
-        mm_toxicity.on_order_filled(true, exec_price,
-                                    std::min(exec_qty, q_tox.bid_size));
-      }
+      try_fill_one(mm_baseline, baseline_state, true, exec_price, exec_qty,
+                   now_ns);
+      try_fill_one(mm_toxicity, toxicity_state, true, exec_price, exec_qty,
+                   now_ns);
       return;
     }
 
     if (resting_side == 'S') {
-      if (q_base.ask_price > 0.0 && q_base.ask_size > 0 &&
-          q_base.ask_price <= exec_price) {
-        mm_baseline.on_order_filled(false, exec_price,
-                                    std::min(exec_qty, q_base.ask_size));
-      }
-      if (q_tox.ask_price > 0.0 && q_tox.ask_size > 0 &&
-          q_tox.ask_price <= exec_price) {
-        mm_toxicity.on_order_filled(false, exec_price,
-                                    std::min(exec_qty, q_tox.ask_size));
-      }
+      try_fill_one(mm_baseline, baseline_state, false, exec_price, exec_qty,
+                   now_ns);
+      try_fill_one(mm_toxicity, toxicity_state, false, exec_price, exec_qty,
+                   now_ns);
     }
   }
 
-  void on_execute(uint64_t order_id, uint32_t exec_qty, double exec_price) {
+  void on_execute(uint64_t order_id, uint32_t exec_qty, double exec_price,
+                  uint64_t now_ns) {
     auto it = order_side.find(order_id);
     if (it != order_side.end()) {
-      maybe_fill_on_execution(it->second, exec_price, exec_qty);
+      maybe_fill_on_execution(it->second, exec_price, exec_qty, now_ns);
     }
 
     order_book_baseline.execute_order(order_id, exec_qty, exec_price);
     order_book_toxicity.execute_order(order_id, exec_qty, exec_price);
-    // No need to recompute quotes here; our paper-fill decision happens
-    // immediately around the execution event.
   }
 };
 
-static std::unordered_map<uint32_t, PerSymbolSim> sims;
-static uint64_t total_executions = 0;
+std::unordered_map<uint32_t, PerSymbolSim> g_sims;
+uint64_t g_total_executions = 0;
 
-void process_xdp_message(const uint8_t *data, size_t max_len,
-                         uint16_t msg_type) {
-  if (max_len < 4)
+void process_xdp_message(const uint8_t *data, size_t max_len, uint16_t msg_type,
+                         uint64_t now_ns) {
+  if (max_len < xdp::MESSAGE_HEADER_SIZE)
     return;
 
-  uint32_t symbol_index = read_symbol_index(msg_type, data, max_len);
+  uint32_t symbol_index = xdp::read_symbol_index(msg_type, data, max_len);
   if (symbol_index == 0)
     return;
-  std::string ticker = get_symbol(symbol_index);
 
-  if (!filter_ticker.empty() && ticker != filter_ticker) {
+  std::string ticker = xdp::get_symbol(symbol_index);
+  if (!g_filter_ticker.empty() && ticker != g_filter_ticker)
     return;
-  }
 
-  PerSymbolSim &sim = sims[symbol_index];
+  PerSymbolSim &sim = g_sims[symbol_index];
+  sim.ensure_init(symbol_index);
 
   switch (msg_type) {
-  case 100: {
-    if (max_len >= 39) {
-      uint64_t order_id = read_le64(data + 16);
-      uint32_t price_raw = read_le32(data + 24);
-      uint32_t volume = read_le32(data + 28);
+  case static_cast<uint16_t>(xdp::MessageType::ADD_ORDER): {
+    if (max_len >= xdp::MessageSize::ADD_ORDER) {
+      uint64_t order_id = xdp::read_le64(data + 16);
+      uint32_t price_raw = xdp::read_le32(data + 24);
+      uint32_t volume = xdp::read_le32(data + 28);
       uint8_t side = data[32];
-      double price = parse_price(price_raw);
-      char side_char = (side == 'B' || side == 1) ? 'B' : 'S';
-
+      double price = xdp::parse_price(price_raw);
+      char side_char = xdp::side_to_char(xdp::parse_side(side));
       sim.on_add(order_id, price, volume, side_char);
     }
     break;
   }
 
-  case 101: {
-    if (max_len >= 35) {
-      uint64_t order_id = read_le64(data + 16);
-      uint32_t price_raw = read_le32(data + 24);
-      uint32_t volume = read_le32(data + 28);
-      double price = parse_price(price_raw);
-
+  case static_cast<uint16_t>(xdp::MessageType::MODIFY_ORDER): {
+    if (max_len >= xdp::MessageSize::MODIFY_ORDER) {
+      uint64_t order_id = xdp::read_le64(data + 16);
+      uint32_t price_raw = xdp::read_le32(data + 24);
+      uint32_t volume = xdp::read_le32(data + 28);
+      double price = xdp::parse_price(price_raw);
       sim.on_modify(order_id, price, volume);
     }
     break;
   }
 
-  case 102: {
-    if (max_len >= 25) {
-      uint64_t order_id = read_le64(data + 16);
+  case static_cast<uint16_t>(xdp::MessageType::DELETE_ORDER): {
+    if (max_len >= xdp::MessageSize::DELETE_ORDER) {
+      uint64_t order_id = xdp::read_le64(data + 16);
       sim.on_delete(order_id);
     }
     break;
   }
 
-  case 103: {
-    if (max_len >= 42) {
-      uint64_t order_id = read_le64(data + 16);
-      uint32_t price_raw = read_le32(data + 28);
-      uint32_t volume = read_le32(data + 32);
-      double price = parse_price(price_raw);
-
-      total_executions++;
-      sim.on_execute(order_id, volume, price);
+  case static_cast<uint16_t>(xdp::MessageType::EXECUTE_ORDER): {
+    if (max_len >= xdp::MessageSize::EXECUTE_ORDER) {
+      uint64_t order_id = xdp::read_le64(data + 16);
+      uint32_t price_raw = xdp::read_le32(data + 28);
+      uint32_t volume = xdp::read_le32(data + 32);
+      double price = xdp::parse_price(price_raw);
+      g_total_executions++;
+      sim.on_execute(order_id, volume, price, now_ns);
     }
     break;
   }
 
-  case 104: {
-    if (max_len >= 42) {
-      uint64_t old_order_id = read_le64(data + 16);
-      uint64_t new_order_id = read_le64(data + 24);
-      uint32_t price_raw = read_le32(data + 32);
-      uint32_t volume = read_le32(data + 36);
-      double price = parse_price(price_raw);
+  case static_cast<uint16_t>(xdp::MessageType::REPLACE_ORDER): {
+    if (max_len >= xdp::MessageSize::REPLACE_ORDER) {
+      uint64_t old_order_id = xdp::read_le64(data + 16);
+      uint64_t new_order_id = xdp::read_le64(data + 24);
+      uint32_t price_raw = xdp::read_le32(data + 32);
+      uint32_t volume = xdp::read_le32(data + 36);
+      double price = xdp::parse_price(price_raw);
       uint8_t side = data[40];
-      char side_char = (side == 'B' || side == 1) ? 'B' : 'S';
-
+      char side_char = xdp::side_to_char(xdp::parse_side(side));
       sim.on_replace(old_order_id, new_order_id, price, volume, side_char);
     }
     break;
   }
+  default:
+    break;
   }
-}
-
-void parse_xdp_packet(const uint8_t *data, size_t length) {
-  if (length < 16)
-    return;
-
-  uint8_t num_messages = data[3];
-  size_t offset = 16;
-
-  for (uint8_t i = 0; i < num_messages && offset < length; i++) {
-    if (offset + 2 > length)
-      break;
-
-    uint16_t msg_size = read_le16(data + offset);
-    if (msg_size < 2 || offset + msg_size > length)
-      break;
-
-    uint16_t msg_type = read_le16(data + offset + 2);
-    process_xdp_message(data + offset, msg_size, msg_type);
-
-    offset += msg_size;
-  }
-}
-
-void packet_handler(u_char *user_data, const struct pcap_pkthdr *pkthdr,
-                    const u_char *packet) {
-  (void)user_data;
-
-  if (pkthdr->caplen < 14)
-    return;
-
-  uint16_t eth_type = ntohs(*(uint16_t *)(packet + 12));
-  size_t eth_header_len = 14;
-
-  if (eth_type == 0x8100 || eth_type == 0x88A8) {
-    if (pkthdr->caplen < 18)
-      return;
-    eth_type = ntohs(*(uint16_t *)(packet + 16));
-    eth_header_len = 18;
-  }
-
-  if (eth_type != 0x0800)
-    return;
-
-  if (pkthdr->caplen < eth_header_len + 20)
-    return;
-  const uint8_t *ip_header = packet + eth_header_len;
-  uint8_t ip_ver_ihl = ip_header[0];
-  uint8_t ip_header_len = (ip_ver_ihl & 0x0F) * 4;
-  uint8_t protocol = ip_header[9];
-
-  if (protocol != 17)
-    return;
-
-  size_t udp_offset = eth_header_len + ip_header_len;
-  if (pkthdr->caplen < udp_offset + 8)
-    return;
-
-  const uint8_t *udp_header = packet + udp_offset;
-  uint16_t udp_len = ntohs(*(uint16_t *)(udp_header + 4));
-
-  const uint8_t *udp_payload = udp_header + 8;
-  size_t payload_len = udp_len - 8;
-
-  if (payload_len > pkthdr->caplen - udp_offset - 8) {
-    payload_len = pkthdr->caplen - udp_offset - 8;
-  }
-
-  if (payload_len < 16)
-    return;
-
-  parse_xdp_packet(udp_payload, payload_len);
 }
 
 void print_results() {
@@ -374,12 +347,12 @@ void print_results() {
   };
 
   std::vector<Row> rows;
-  rows.reserve(sims.size());
+  rows.reserve(g_sims.size());
 
   double portfolio_baseline = 0.0;
   double portfolio_toxicity = 0.0;
 
-  for (const auto &kv : sims) {
+  for (const auto &kv : g_sims) {
     const uint32_t symbol_index = kv.first;
     const PerSymbolSim &sim = kv.second;
 
@@ -395,14 +368,13 @@ void print_results() {
     portfolio_baseline += baseline_total;
     portfolio_toxicity += toxicity_total;
 
-    rows.push_back(Row{symbol_index, get_symbol(symbol_index), baseline_total,
-                       toxicity_total, improvement, baseline_stats.total_fills,
-                       toxicity_stats.total_fills});
+    rows.push_back(Row{symbol_index, xdp::get_symbol(symbol_index),
+                       baseline_total, toxicity_total, improvement,
+                       baseline_stats.total_fills, toxicity_stats.total_fills});
   }
 
-  std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) {
-    return a.improvement > b.improvement;
-  });
+  std::sort(rows.begin(), rows.end(),
+            [](const Row &a, const Row &b) { return a.improvement > b.improvement; });
 
   const double portfolio_improvement = portfolio_toxicity - portfolio_baseline;
   const double portfolio_improvement_pct =
@@ -410,22 +382,20 @@ void print_results() {
           ? (portfolio_improvement / std::abs(portfolio_baseline)) * 100.0
           : 0.0;
 
-  std::cout << "\n=== MARKET MAKER PORTFOLIO RESULTS ===" << std::endl;
-  std::cout << "Symbols simulated: " << rows.size() << std::endl;
-  std::cout << "Total executions processed: " << total_executions << std::endl;
+  std::cout << "\n=== MARKET MAKER PORTFOLIO RESULTS ===\n";
+  std::cout << "Symbols simulated: " << rows.size() << '\n';
+  std::cout << "Total executions processed: " << g_total_executions << '\n';
 
-  std::cout << "\n--- PORTFOLIO TOTALS ---" << std::endl;
+  std::cout << "\n--- PORTFOLIO TOTALS ---\n";
   std::cout << "Baseline Total PnL: $" << std::fixed << std::setprecision(2)
-            << portfolio_baseline << std::endl;
+            << portfolio_baseline << '\n';
   std::cout << "Toxicity Total PnL: $" << std::fixed << std::setprecision(2)
-            << portfolio_toxicity << std::endl;
+            << portfolio_toxicity << '\n';
   std::cout << "PnL Improvement: $" << std::fixed << std::setprecision(2)
             << portfolio_improvement << " (" << std::fixed
-            << std::setprecision(2) << portfolio_improvement_pct << "%)"
-            << std::endl;
+            << std::setprecision(2) << portfolio_improvement_pct << "%)\n";
 
-  std::cout << "\n--- TOP 5 SYMBOLS BY IMPROVEMENT (Toxicity - Baseline) ---"
-            << std::endl;
+  std::cout << "\n--- TOP 5 SYMBOLS BY IMPROVEMENT ---\n";
   const size_t top_n = std::min<size_t>(5, rows.size());
   for (size_t i = 0; i < top_n; i++) {
     const Row &r = rows[i];
@@ -433,26 +403,35 @@ void print_results() {
               << "): $" << std::fixed << std::setprecision(2) << r.improvement
               << " | baseline $" << r.baseline_total << " | tox $"
               << r.toxicity_total << " | fills " << r.baseline_fills << " vs "
-              << r.toxicity_fills << std::endl;
+              << r.toxicity_fills << '\n';
   }
 
-  if (!filter_ticker.empty() && rows.size() == 1) {
+  if (!g_filter_ticker.empty() && rows.size() == 1) {
     const Row &r = rows[0];
-    std::cout << "\n--- SINGLE SYMBOL DETAIL (" << r.ticker << ") ---"
-              << std::endl;
+    std::cout << "\n--- SINGLE SYMBOL DETAIL (" << r.ticker << ") ---\n";
     std::cout << "Baseline Total PnL: $" << std::fixed << std::setprecision(2)
-              << r.baseline_total << std::endl;
+              << r.baseline_total << '\n';
     std::cout << "Toxicity Total PnL: $" << std::fixed << std::setprecision(2)
-              << r.toxicity_total << std::endl;
+              << r.toxicity_total << '\n';
     std::cout << "PnL Improvement: $" << std::fixed << std::setprecision(2)
-              << r.improvement << std::endl;
+              << r.improvement << '\n';
   }
 }
 
+void print_usage(const char *program) {
+  std::cerr << "Usage: " << program
+            << " <pcap_file> [symbol_file] [-t ticker] "
+               "[--seed N] [--latency-ms M] [--latency-jitter-ms J] "
+               "[--queue-ahead MEAN] [--queue-ahead-cv CV] "
+               "[--miss-prob P] [--fee-per-share F] "
+               "[--fill-mode cross|match] [--quote-interval-ms Q]\n";
+}
+
+} // namespace
+
 int main(int argc, char *argv[]) {
   if (argc < 2) {
-    std::cerr << "Usage: " << argv[0]
-              << " <pcap_file> [symbol_file] [-t ticker]" << std::endl;
+    print_usage(argv[0]);
     return 1;
   }
 
@@ -460,48 +439,90 @@ int main(int argc, char *argv[]) {
   std::string symbol_file = "data/symbol_nyse.txt";
 
   for (int i = 2; i < argc; i++) {
-    if (std::string(argv[i]) == "-t" && i + 1 < argc) {
-      filter_ticker = argv[i + 1];
-      i++;
+    const std::string arg = argv[i];
+    if (arg == "-t" && i + 1 < argc) {
+      g_filter_ticker = argv[++i];
+    } else if (arg == "--seed" && i + 1 < argc) {
+      g_exec.seed = std::stoull(argv[++i]);
+    } else if (arg == "--latency-ms" && i + 1 < argc) {
+      g_exec.latency_ms_mean = std::stod(argv[++i]);
+    } else if (arg == "--latency-jitter-ms" && i + 1 < argc) {
+      g_exec.latency_ms_jitter = std::stod(argv[++i]);
+    } else if (arg == "--queue-ahead" && i + 1 < argc) {
+      g_exec.queue_ahead_mean = static_cast<uint32_t>(std::stoul(argv[++i]));
+    } else if (arg == "--queue-ahead-cv" && i + 1 < argc) {
+      g_exec.queue_ahead_cv = std::stod(argv[++i]);
+    } else if (arg == "--miss-prob" && i + 1 < argc) {
+      g_exec.miss_prob = std::stod(argv[++i]);
+    } else if (arg == "--fee-per-share" && i + 1 < argc) {
+      g_exec.fee_per_share = std::stod(argv[++i]);
+    } else if (arg == "--fill-mode" && i + 1 < argc) {
+      const std::string mode = argv[++i];
+      if (mode == "match") {
+        g_exec.fill_mode = ExecutionModelConfig::FillMode::Match;
+      } else {
+        g_exec.fill_mode = ExecutionModelConfig::FillMode::Cross;
+      }
+    } else if (arg == "--quote-interval-ms" && i + 1 < argc) {
+      const double ms = std::max(0.0, std::stod(argv[++i]));
+      g_exec.quote_interval_ns = static_cast<uint64_t>(ms * 1000000.0);
     } else {
       symbol_file = argv[i];
     }
   }
 
-  load_symbol_map(symbol_file.c_str());
+  (void)xdp::load_symbol_map(symbol_file);
 
-  if (!filter_ticker.empty()) {
-    std::cout << "Filtering for ticker: " << filter_ticker << std::endl;
+  if (!g_filter_ticker.empty()) {
+    std::cout << "Filtering for ticker: " << g_filter_ticker << '\n';
   }
 
-  char errbuf[PCAP_ERRBUF_SIZE];
-  pcap_t *handle = pcap_open_offline(pcap_file.c_str(), errbuf);
-
-  if (handle == nullptr) {
-    std::cerr << "Error opening PCAP file: " << errbuf << std::endl;
+  xdp::PcapReader reader;
+  if (!reader.open(pcap_file)) {
+    std::cerr << "Error opening PCAP file: " << reader.error() << '\n';
     return 1;
   }
 
-  std::cout << "Processing PCAP file: " << pcap_file << std::endl;
-  std::cout << "Running baseline and toxicity-aware strategies..." << std::endl;
+  std::cout << "Processing PCAP file: " << pcap_file << '\n';
+  std::cout << "Running baseline and toxicity-aware strategies...\n";
 
   uint64_t packet_count = 0;
-  struct pcap_pkthdr header;
-  const u_char *packet;
 
-  while ((packet = pcap_next(handle, &header)) != nullptr) {
-    packet_handler(nullptr, &header, packet);
+  auto packet_callback = [&packet_count](const uint8_t *data, size_t length,
+                                          uint64_t, const xdp::NetworkPacketInfo &info) {
     packet_count++;
 
-    if (packet_count % 100000 == 0) {
-      std::cout << "Processed " << packet_count << " packets..." << std::endl;
+    if (length < xdp::PACKET_HEADER_SIZE)
+      return;
+
+    xdp::PacketHeader pkt_header;
+    if (!xdp::parse_packet_header(data, length, pkt_header))
+      return;
+
+    size_t offset = xdp::PACKET_HEADER_SIZE;
+
+    for (uint8_t i = 0; i < pkt_header.num_messages && offset < length; i++) {
+      if (offset + xdp::MESSAGE_HEADER_SIZE > length)
+        break;
+
+      uint16_t msg_size = xdp::read_le16(data + offset);
+      if (msg_size < xdp::MESSAGE_HEADER_SIZE || offset + msg_size > length)
+        break;
+
+      uint16_t msg_type = xdp::read_le16(data + offset + 2);
+      process_xdp_message(data + offset, msg_size, msg_type, info.timestamp_ns);
+
+      offset += msg_size;
     }
-  }
 
-  pcap_close(handle);
+    if (packet_count % 100000 == 0) {
+      std::cout << "Processed " << packet_count << " packets...\n";
+    }
+  };
 
-  std::cout << "\nFinished processing " << packet_count << " packets"
-            << std::endl;
+  reader.process_all(packet_callback);
+
+  std::cout << "\nFinished processing " << packet_count << " packets\n";
 
   print_results();
 

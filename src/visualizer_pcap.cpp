@@ -9,7 +9,13 @@
 #else
 #include <GL/gl.h>
 #endif
+
+#include "common/pcap_reader.hpp"
+#include "common/symbol_map.hpp"
+#include "common/xdp_types.hpp"
+#include "common/xdp_utils.hpp"
 #include "order_book.hpp"
+
 #include <algorithm>
 #include <arpa/inet.h>
 #include <atomic>
@@ -27,13 +33,12 @@
 #include <unordered_set>
 #include <vector>
 
-// Forward declarations
-uint16_t read_le16(const uint8_t *data);
-uint32_t read_le32(const uint8_t *data);
-uint64_t read_le64(const uint8_t *data);
-double parse_price(uint32_t price_raw);
-std::string get_symbol(uint32_t symbol_index);
-void load_symbol_map(const char *filename);
+// Use functions from common modules
+using xdp::read_le16;
+using xdp::read_le32;
+using xdp::read_le64;
+using xdp::parse_price;
+using xdp::get_symbol;
 
 // Global order book and synchronization
 OrderBook order_book;
@@ -1602,92 +1607,6 @@ bool OrderBookVisualizer::should_close() {
   return false;
 }
 
-// Helper functions from reader.cpp
-uint16_t read_le16(const uint8_t *data) { return data[0] | (data[1] << 8); }
-
-uint32_t read_le32(const uint8_t *data) {
-  return data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24);
-}
-
-uint64_t read_le64(const uint8_t *data) {
-  return (uint64_t)read_le32(data) | ((uint64_t)read_le32(data + 4) << 32);
-}
-
-double parse_price(uint32_t price_raw) { return price_raw / 10000.0; }
-
-std::unordered_map<uint32_t, std::string> symbol_map;
-
-std::string get_symbol(uint32_t symbol_index) {
-  auto it = symbol_map.find(symbol_index);
-  if (it != symbol_map.end()) {
-    return it->second;
-  }
-  return "UNKNOWN";
-}
-
-void load_symbol_map(const char *filename) {
-  std::ifstream file(filename);
-  if (!file.is_open()) {
-    std::cerr << "Warning: Could not open symbol file: " << filename
-              << std::endl;
-    return;
-  }
-
-  std::string line;
-
-  while (std::getline(file, line)) {
-    // Skip empty lines
-    if (line.empty())
-      continue;
-
-    // Remove Windows carriage return if present
-    if (!line.empty() && line.back() == '\r') {
-      line.pop_back();
-    }
-
-    // Trim trailing whitespace
-    while (!line.empty() && std::isspace(line.back())) {
-      line.pop_back();
-    }
-
-    // Skip if line is now empty
-    if (line.empty())
-      continue;
-
-    // Split by pipe delimiter
-    std::vector<std::string> tokens;
-    std::string token;
-    std::istringstream iss(line);
-
-    while (std::getline(iss, token, '|')) {
-      tokens.push_back(token);
-    }
-
-    // We need at least 3 fields: Symbol|Symbol|Index|...
-    if (tokens.size() >= 3) {
-      std::string symbol = tokens[0];
-      std::string index_str = tokens[2];
-
-      // Convert index to uint32_t
-      char *endptr;
-      unsigned long index_val = strtoul(index_str.c_str(), &endptr, 10);
-      if (endptr != index_str.c_str() && *endptr == '\0' && index_val > 0 &&
-          index_val <= UINT32_MAX) {
-        uint32_t index = (uint32_t)index_val;
-        if (!symbol.empty()) {
-          symbol_map[index] = symbol;
-        }
-      }
-    }
-  }
-
-  if (symbol_map.empty()) {
-    std::cerr << "Warning: No symbols loaded from " << filename << std::endl;
-    std::cerr << "Check that the file format is: Symbol|Symbol|Index|..."
-              << std::endl;
-  }
-}
-
 int main(int argc, char *argv[]) {
   std::string pcap_file;
   std::string symbol_file = "data/symbol_nyse.txt";
@@ -1714,9 +1633,9 @@ int main(int argc, char *argv[]) {
   }
 
   // Load symbol mapping
-  load_symbol_map(symbol_file.c_str());
+  size_t symbols_loaded = xdp::load_symbol_map(symbol_file);
 
-  std::cout << "Loaded " << symbol_map.size() << " symbols from " << symbol_file
+  std::cout << "Loaded " << symbols_loaded << " symbols from " << symbol_file
             << std::endl;
 
   if (!filter_ticker.empty()) {

@@ -2,6 +2,7 @@
 
 #include "order_book.hpp"
 #include <chrono>
+#include <cstdint>
 #include <mutex>
 #include <unordered_map>
 
@@ -30,51 +31,68 @@ struct MarketMakerQuote {
 };
 
 class MarketMakerStrategy {
-private:
-  OrderBook &order_book;
-  bool use_toxicity_screen;
-
-  int64_t inventory;
-  double realized_pnl;
-  double unrealized_pnl;
-  // Average entry price for the current position.
-  // - If inventory > 0 (long): avg_entry_price is the average buy price.
-  // - If inventory < 0 (short): avg_entry_price is the average sell(short)
-  // price.
-  double avg_entry_price;
-
-  MarketMakerQuote current_quotes;
-  std::unordered_map<uint64_t, bool> our_order_ids;
-  mutable std::mutex strategy_mutex;
-
-  double base_spread;
-  double min_spread;
-  double max_spread;
-  uint32_t base_quote_size;
-  double max_position;
-  double tick_size;
-
-  double inventory_skew_coefficient;
-  double toxicity_spread_multiplier;
-
-  MarketMakerStats stats;
-
-  double round_to_tick(double price) const;
-  double calculate_toxicity_adjusted_spread(double base_spread_val) const;
-  double calculate_inventory_skew() const;
-
 public:
-  MarketMakerStrategy(OrderBook &ob, bool use_toxicity = false);
+  explicit MarketMakerStrategy(OrderBook &ob, bool use_toxicity = false);
 
+  // Non-copyable
+  MarketMakerStrategy(const MarketMakerStrategy &) = delete;
+  MarketMakerStrategy &operator=(const MarketMakerStrategy &) = delete;
+
+  // Update market data and recalculate quotes
   void update_market_data();
-  MarketMakerQuote get_current_quotes() const;
+
+  // Get current quotes (thread-safe)
+  [[nodiscard]] MarketMakerQuote get_current_quotes() const;
+
+  // Handle order fill events
   void on_order_filled(bool is_buy, double price, uint32_t size);
+
+  // Order management
   void register_our_order(uint64_t order_id);
-  bool is_our_order(uint64_t order_id) const;
+  [[nodiscard]] bool is_our_order(uint64_t order_id) const;
   void on_order_cancelled(uint64_t order_id);
-  MarketMakerStats get_stats() const;
-  double get_inventory() const;
+
+  // Configuration setters
+  void set_fee_per_share(double fee);
   void set_base_spread(double spread);
   void set_toxicity_multiplier(double multiplier);
+
+  // Getters
+  [[nodiscard]] MarketMakerStats get_stats() const;
+  [[nodiscard]] double get_inventory() const;
+
+  // Reset strategy state
   void reset();
+
+private:
+  OrderBook &order_book_;
+  bool use_toxicity_screen_;
+
+  int64_t inventory_ = 0;
+  double realized_pnl_ = 0.0;
+  double unrealized_pnl_ = 0.0;
+  double fee_per_share_ = 0.0;
+  double avg_entry_price_ = 0.0;
+
+  MarketMakerQuote current_quotes_;
+  std::unordered_map<uint64_t, bool> our_order_ids_;
+  mutable std::mutex strategy_mutex_;
+
+  // Strategy parameters
+  double base_spread_ = 0.01;
+  double min_spread_ = 0.01;
+  double max_spread_ = 0.10;
+  uint32_t base_quote_size_ = 100;
+  double max_position_ = 1000.0;
+  double tick_size_ = 0.01;
+
+  double inventory_skew_coefficient_ = 0.005;
+  double toxicity_spread_multiplier_ = 2.0;
+
+  MarketMakerStats stats_;
+
+  // Helper methods
+  [[nodiscard]] double round_to_tick(double price) const noexcept;
+  [[nodiscard]] double calculate_toxicity_adjusted_spread(double base_spread_val) const;
+  [[nodiscard]] double calculate_inventory_skew() const noexcept;
 };
