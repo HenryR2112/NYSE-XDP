@@ -29,14 +29,20 @@ namespace xdp {
          (static_cast<uint64_t>(p[7]) << 56);
 }
 
-// Price parsing: NYSE XDP prices are in ten-thousandths (1/10000) of a dollar
-// Some captures may be scaled 100x higher; this applies a heuristic correction
+// Price parsing using explicit multiplier from symbol data
+// The multiplier converts raw integer price to actual dollar price
+// Example: raw=150000000, multiplier=1e-6 -> price=$150.00
+[[nodiscard]] inline double parse_price(uint32_t price_raw,
+                                        double multiplier) noexcept {
+  return static_cast<double>(price_raw) * multiplier;
+}
+
+// Legacy price parsing with heuristic (for backward compatibility)
+// Prefers explicit multiplier version when symbol data is available
 [[nodiscard]] inline double parse_price(uint32_t price_raw) noexcept {
-  double p = static_cast<double>(price_raw) / 10000.0;
-  if (p > 10000.0) {
-    p = static_cast<double>(price_raw) / 1000000.0;
-  }
-  return p;
+  // Default to 1e-6 multiplier (divide by 1,000,000)
+  // This matches price_scale_code=6 which is most common
+  return static_cast<double>(price_raw) * 1e-6;
 }
 
 // Format timestamp with microsecond precision

@@ -50,7 +50,7 @@
         "-t",
         "AAPL",
         "-s",
-        "data/symbol_nyse.txt"
+        "data/symbol_nyse_parsed.csv"
       ],
       "group": "test",
       "dependsOn": "build",
@@ -67,7 +67,7 @@
       "args": [
         "data/ny4-xnys-pillar-a-20230822T133000.pcap",
         "-s",
-        "data/symbol_nyse.txt"
+        "data/symbol_nyse_parsed.csv"
       ],
       "group": "test",
       "dependsOn": "build",
@@ -96,7 +96,7 @@
       "command": "${workspaceFolder}/build/market_maker_sim",
       "args": [
         "data/ny4-xnys-pillar-a-20230822T133000.pcap",
-        "data/symbol_nyse.txt",
+        "data/symbol_nyse_parsed.csv",
         "-t",
         "AAPL"
       ],
@@ -114,7 +114,51 @@
       "command": "${workspaceFolder}/build/market_maker_sim",
       "args": [
         "data/ny4-xnys-pillar-a-20230822T133000.pcap",
-        "data/symbol_nyse.txt"
+        "data/symbol_nyse_parsed.csv"
+      ],
+      "group": "test",
+      "dependsOn": "build market_maker_sim",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
+      "label": "run market maker (full day)",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/run_full_day.sh",
+      "group": "test",
+      "dependsOn": "build market_maker_sim",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
+      "label": "run market maker (full day - trading hours)",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/run_full_day.sh",
+      "args": [
+        "--trading-hours-only"
+      ],
+      "group": "test",
+      "dependsOn": "build market_maker_sim",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
+      "label": "run market maker (full day - AAPL)",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/run_full_day.sh",
+      "args": [
+        "-t",
+        "AAPL",
+        "--trading-hours-only"
       ],
       "group": "test",
       "dependsOn": "build market_maker_sim",

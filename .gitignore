@@ -20,4 +20,5 @@ compile_commands.json
 .DS_Store
 Thumbs.db
 # End of Selection
+.venv
 ```

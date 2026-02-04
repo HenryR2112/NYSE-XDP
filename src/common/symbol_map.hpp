@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -7,18 +8,41 @@
 
 namespace xdp {
 
+// Enhanced symbol information from parsed CSV
+struct SymbolInfo {
+  std::string symbol;           // Trading symbol (e.g., "AAPL")
+  std::string cqs_symbol;       // CQS symbol (e.g., "AAPL")
+  uint32_t symbol_id;           // Unique symbol index
+  std::string exchange_code;    // Exchange code (e.g., "NYSE")
+  std::string listed_market;    // Listed market (e.g., "NASDAQ", "NYSE Arca")
+  std::string ticker_designation; // Tape designation (e.g., "Tape A", "Tape B", "Tape C")
+  uint32_t lot_size;            // Round lot size (typically 100)
+  uint8_t price_scale_code;     // Price scale code for multiplier
+  uint32_t system_id;           // System ID
+  std::string asset_type;       // Asset type (e.g., "Common Stock", "ETF")
+  double price_multiplier;      // Multiplier to convert raw price to actual price
+};
+
 class SymbolMap {
 public:
   SymbolMap() = default;
 
-  // Load symbol mappings from a pipe-delimited file
-  // Format: SYMBOL|EXCHANGE|INDEX|...
+  // Load symbol mappings from a CSV file
+  // Format: symbol,cqs_symbol,symbol_id,exchange_code,listed_market,ticker_designation,lot_size,price_scale_code,system_id,asset_type,price_multiplier
   // Returns number of symbols loaded, or 0 on failure
   [[nodiscard]] size_t load(const std::string &filename);
 
   // Get symbol for an index
   // Returns the symbol string, or the index as string if not found
   [[nodiscard]] std::string get_symbol(uint32_t index) const;
+
+  // Get full symbol info for an index
+  // Returns nullopt if not found
+  [[nodiscard]] std::optional<SymbolInfo> get_symbol_info(uint32_t index) const;
+
+  // Get price multiplier for a symbol index
+  // Returns 1e-6 (default) if not found
+  [[nodiscard]] double get_price_multiplier(uint32_t index) const;
 
   // Get symbol as optional (returns nullopt if not found)
   [[nodiscard]] std::optional<std::string> find_symbol(uint32_t index) const;
@@ -36,13 +60,13 @@ public:
   void clear() noexcept { symbols_.clear(); }
 
   // Get the underlying map (for iteration)
-  [[nodiscard]] const std::unordered_map<uint32_t, std::string> &
+  [[nodiscard]] const std::unordered_map<uint32_t, SymbolInfo> &
   get_map() const noexcept {
     return symbols_;
   }
 
 private:
-  std::unordered_map<uint32_t, std::string> symbols_;
+  std::unordered_map<uint32_t, SymbolInfo> symbols_;
 };
 
 // Global symbol map instance for backward compatibility

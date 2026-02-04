@@ -56,14 +56,65 @@ double MarketMakerStrategy::calculate_toxicity_adjusted_spread(
 
 double MarketMakerStrategy::calculate_inventory_skew() const noexcept {
   double inventory_ratio = static_cast<double>(inventory_) / max_position_;
-  return -inventory_ratio * inventory_skew_coefficient_;
+  // Non-linear skew: more aggressive as position grows
+  double skew = -inventory_ratio * inventory_skew_coefficient_;
+  // Add quadratic term for larger positions
+  skew -= 0.5 * inventory_ratio * std::abs(inventory_ratio) * inventory_skew_coefficient_;
+  return skew;
+}
+
+double MarketMakerStrategy::calculate_obi() const {
+  auto book_stats = order_book_.get_stats();
+  double total_qty = static_cast<double>(book_stats.total_bid_qty + book_stats.total_ask_qty);
+  if (total_qty < 1.0) return 0.0;
+  // OBI ranges from -1 (all asks) to +1 (all bids)
+  return (static_cast<double>(book_stats.total_bid_qty) -
+          static_cast<double>(book_stats.total_ask_qty)) / total_qty;
+}
+
+double MarketMakerStrategy::get_average_toxicity() const {
+  double toxicity_sum = 0.0;
+  int toxicity_count = 0;
+  constexpr int levels_to_check = 3;
+
+  auto bids = order_book_.get_bids();
+  auto asks = order_book_.get_asks();
+
+  int bid_levels = 0;
+  for (const auto &[price, qty] : bids) {
+    if (bid_levels >= levels_to_check) break;
+    toxicity_sum += order_book_.get_toxicity(price, 'B');
+    toxicity_count++;
+    bid_levels++;
+  }
+
+  int ask_levels = 0;
+  for (const auto &[price, qty] : asks) {
+    if (ask_levels >= levels_to_check) break;
+    toxicity_sum += order_book_.get_toxicity(price, 'S');
+    toxicity_count++;
+    ask_levels++;
+  }
+
+  return (toxicity_count > 0) ? toxicity_sum / toxicity_count : 0.0;
 }
 
 void MarketMakerStrategy::update_market_data() {
+  // Calculate OBI and toxicity before acquiring strategy lock
+  // (these methods acquire the order book lock internally)
+  double avg_toxicity = 0.0;
+  double obi = 0.0;
+
+  if (use_toxicity_screen_) {
+    avg_toxicity = get_average_toxicity();
+    obi = calculate_obi();
+  }
+
   std::lock_guard<std::mutex> lock(strategy_mutex_);
   auto book_stats = order_book_.get_stats();
 
   if (book_stats.best_bid == 0.0 || book_stats.best_ask == 0.0) {
+    current_quotes_.is_quoted = false;
     return;
   }
 
@@ -71,6 +122,31 @@ void MarketMakerStrategy::update_market_data() {
   double spread = calculate_toxicity_adjusted_spread(base_spread_);
   double half_spread = spread / 2.0;
   double inventory_skew = calculate_inventory_skew();
+
+  if (use_toxicity_screen_) {
+    stats_.avg_toxicity = avg_toxicity;
+
+    // Skip quoting entirely if toxicity is too high
+    if (avg_toxicity > toxicity_quote_threshold_) {
+      stats_.quotes_suppressed++;
+      current_quotes_.is_quoted = false;
+      current_quotes_.bid_size = 0;
+      current_quotes_.ask_size = 0;
+      return;
+    }
+
+    // Calculate expected PnL and check if we should quote
+    double inventory_risk = gamma_risk_ * inventory_ * inventory_;
+    double expected_pnl = calculate_expected_pnl(spread, avg_toxicity, inventory_risk);
+
+    if (!should_quote(expected_pnl)) {
+      stats_.quotes_suppressed++;
+      current_quotes_.is_quoted = false;
+      current_quotes_.bid_size = 0;
+      current_quotes_.ask_size = 0;
+      return;
+    }
+  }
 
   current_quotes_.bid_price =
       round_to_tick(mid_price - half_spread + inventory_skew);
@@ -83,17 +159,48 @@ void MarketMakerStrategy::update_market_data() {
     current_quotes_.ask_price = round_to_tick(mid_price + tick_size_);
   }
 
-  // Adjust quote sizes based on inventory
-  if (inventory_ > max_position_ * 0.5) {
+  // Start with base sizes
+  current_quotes_.bid_size = base_quote_size_;
+  current_quotes_.ask_size = base_quote_size_;
+
+  // Adjust quote sizes based on inventory (more aggressive)
+  double inventory_pct = static_cast<double>(inventory_) / max_position_;
+  if (inventory_pct > 0.7) {
+    // Very long: stop buying, sell aggressively
+    current_quotes_.bid_size = 0;
+    current_quotes_.ask_size = base_quote_size_ * 3;
+  } else if (inventory_pct > 0.3) {
+    // Moderately long: reduce buying, increase selling
     current_quotes_.bid_size = base_quote_size_ / 2;
     current_quotes_.ask_size = base_quote_size_ * 2;
-  } else if (inventory_ < -max_position_ * 0.5) {
+  } else if (inventory_pct < -0.7) {
+    // Very short: stop selling, buy aggressively
+    current_quotes_.bid_size = base_quote_size_ * 3;
+    current_quotes_.ask_size = 0;
+  } else if (inventory_pct < -0.3) {
+    // Moderately short: reduce selling, increase buying
     current_quotes_.bid_size = base_quote_size_ * 2;
     current_quotes_.ask_size = base_quote_size_ / 2;
-  } else {
-    current_quotes_.bid_size = base_quote_size_;
-    current_quotes_.ask_size = base_quote_size_;
   }
+
+  // OBI-based quote adjustment (only for toxicity-aware strategy)
+  if (use_toxicity_screen_) {
+    // Strong positive OBI (more bids) suggests price going up
+    // -> safer to buy, riskier to sell
+    if (obi > obi_threshold_) {
+      // Price likely going up: reduce/skip sell side
+      current_quotes_.ask_size = current_quotes_.ask_size / 2;
+      // Widen ask price to avoid adverse selection
+      current_quotes_.ask_price = round_to_tick(current_quotes_.ask_price + tick_size_);
+    } else if (obi < -obi_threshold_) {
+      // Price likely going down: reduce/skip buy side
+      current_quotes_.bid_size = current_quotes_.bid_size / 2;
+      // Widen bid price to avoid adverse selection
+      current_quotes_.bid_price = round_to_tick(current_quotes_.bid_price - tick_size_);
+    }
+  }
+
+  current_quotes_.is_quoted = (current_quotes_.bid_size > 0 || current_quotes_.ask_size > 0);
 
   // Update unrealized PnL
   double last_trade = order_book_.get_last_trade();
@@ -266,16 +373,17 @@ double MarketMakerStrategy::calculate_toxicity_score(double cancel_rate, double 
 }
 
 double MarketMakerStrategy::calculate_expected_pnl(double spread, double toxicity, double inventory_risk) const noexcept {
-  // Equation (14) from strategy proposal
-  // E[PnL] = P(fill) · (s/2 - p_toxic · μ_a) - γI²
+  // Modified equation (14) from strategy proposal to include rebates
+  // E[PnL] = P(fill) · (s/2 + rebate - p_toxic · μ_a) - γI²
   double half_spread_capture = spread / 2.0;
+  double rebate_per_share = -fee_per_share_;  // Negative fee = rebate
   double expected_adverse = toxicity * mu_adverse_;
-  double expected_pnl = fill_probability_ * (half_spread_capture - expected_adverse) - inventory_risk;
+  double expected_pnl = fill_probability_ * (half_spread_capture + rebate_per_share - expected_adverse) - inventory_risk;
   return expected_pnl;
 }
 
 bool MarketMakerStrategy::should_quote(double expected_pnl) const noexcept {
-  // Equation (15) from strategy proposal
-  // Quote only if E[PnL] > 0 and |I| < I_max
-  return expected_pnl > 0.0 && std::abs(inventory_) < max_position_;
+  // Require positive expected PnL for profitability
+  // Tuned for profitability
+  return expected_pnl > 0.0018 && std::abs(inventory_) < max_position_;
 }

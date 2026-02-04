@@ -312,7 +312,7 @@ void pcap_reader_thread(const std::string &pcap_file)
 int main(int argc, char *argv[])
 {
   std::string pcap_file;
-  std::string symbol_file = "data/symbol_nyse.txt";
+  std::string symbol_file = "data/symbol_nyse_parsed.csv";
 
   // Parse command line arguments
   for (int i = 1; i < argc; i++)
@@ -335,7 +335,7 @@ int main(int argc, char *argv[])
   {
     std::cerr << "Usage: " << argv[0] << " <pcap_file> [-t ticker] [-s symbol_file]" << std::endl;
     std::cerr << "Example: " << argv[0] << " data/ny4-xnys-pillar-a-20230822T133000.pcap -t AAPL" << std::endl;
-    std::cerr << "Default symbol file: data/symbol_nyse.txt" << std::endl;
+    std::cerr << "Default symbol file: data/symbol_nyse_parsed.csv" << std::endl;
     return 1;
   }
 

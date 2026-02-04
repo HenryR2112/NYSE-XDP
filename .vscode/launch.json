@@ -11,7 +11,7 @@
         "-t",
         "AAPL",
         "-s",
-        "data/symbol_nyse.txt"
+        "data/symbol_nyse_parsed.csv"
       ],
       "stopAtEntry": false,
       "cwd": "${workspaceFolder}",
@@ -28,7 +28,7 @@
       "args": [
         "data/ny4-xnys-pillar-a-20230822T133000.pcap",
         "-s",
-        "data/symbol_nyse.txt"
+        "data/symbol_nyse_parsed.csv"
       ],
       "stopAtEntry": false,
       "cwd": "${workspaceFolder}",
@@ -47,7 +47,7 @@
         "-t",
         "${input:ticker}",
         "-s",
-        "data/symbol_nyse.txt"
+        "data/symbol_nyse_parsed.csv"
       ],
       "stopAtEntry": false,
       "cwd": "${workspaceFolder}",
@@ -63,7 +63,7 @@
       "program": "${workspaceFolder}/build/market_maker_sim",
       "args": [
         "data/ny4-xnys-pillar-a-20230822T133000.pcap",
-        "data/symbol_nyse.txt",
+        "data/symbol_nyse_parsed.csv",
         "-t",
         "AAPL"
       ],
@@ -81,7 +81,7 @@
       "program": "${workspaceFolder}/build/market_maker_sim",
       "args": [
         "data/ny4-xnys-pillar-a-20230822T133000.pcap",
-        "data/symbol_nyse.txt"
+        "data/symbol_nyse_parsed.csv"
       ],
       "stopAtEntry": false,
       "cwd": "${workspaceFolder}",
@@ -97,7 +97,7 @@
       "program": "${workspaceFolder}/build/market_maker_sim",
       "args": [
         "data/ny4-xnys-pillar-a-20230822T133000.pcap",
-        "data/symbol_nyse.txt",
+        "data/symbol_nyse_parsed.csv",
         "-t",
         "${input:ticker}"
       ],
