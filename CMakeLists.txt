@@ -84,6 +84,7 @@ target_include_directories(market_maker_sim PRIVATE
 target_link_libraries(market_maker_sim PRIVATE
     xdp_common
     ${LIBPCAP_LIBRARIES}
+    pthread
 )
 
 # Compiler flags
@@ -209,8 +210,15 @@ target_compile_options(visualizer PRIVATE
 
 # Debug flags
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0")
-# Release flags
+
+# Release flags - aggressive optimization for maximum throughput
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -march=native")      # Use all CPU features (AVX2, etc.)
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -mtune=native")      # Tune for current CPU
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -flto")              # Link-time optimization
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -ffast-math")        # Faster floating point
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -funroll-loops")     # Loop unrolling
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -fomit-frame-pointer") # Extra register
 
 # Generate compile_commands.json for clangd/clang-tidy
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)

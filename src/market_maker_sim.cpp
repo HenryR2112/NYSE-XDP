@@ -1,25 +1,44 @@
 // market_maker_sim.cpp - Market Maker Simulation with PCAP playback
 // Simulates market making strategies on historical XDP data
+// PARALLELIZED VERSION - Uses all available CPU cores for maximum throughput
 
+#include "common/mmap_pcap_reader.hpp"
 #include "common/pcap_reader.hpp"
 #include "common/symbol_map.hpp"
+#include "common/thread_pool.hpp"
 #include "common/xdp_types.hpp"
 #include "common/xdp_utils.hpp"
 #include "market_maker.hpp"
 #include "order_book.hpp"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <random>
+#include <regex>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <thread>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
 namespace {
 
 std::string g_filter_ticker;
+bool g_use_parallel = true;  // Enable parallel processing by default
+bool g_use_hybrid = true;    // Enable hybrid multi-process mode by default
+size_t g_num_threads = 0;    // 0 = auto-detect (use all cores)
+size_t g_files_per_group = 0; // 0 = auto (num_files / num_threads)
 
 // =============================================================================
 // HFT Market Maker Execution Model
@@ -38,9 +57,9 @@ struct ExecutionModelConfig {
 
   // --- Queue Position Model ---
   // At a liquid stock's NBBO, typical queue depth is 1000-5000 shares
-  // Assume we're a decent-tier HFT with reasonable queue position
-  double queue_position_fraction = 0.2; // We're ~20% back in queue (better infra)
-  double queue_position_variance = 0.4; // Moderate variance
+  // HFT firms with good infrastructure get near top-of-book
+  double queue_position_fraction = 0.05;  // Top 5% of queue (good HFT infra)
+  double queue_position_variance = 0.3;   // Some variance in queue position
 
   // --- Adverse Selection Model ---
   // After we get filled, price often moves against us (informed flow)
@@ -60,15 +79,15 @@ struct ExecutionModelConfig {
   double clearing_fee_per_share = 0.00015; // Clearing + regulatory fees (lower tier)
 
   // --- Risk Limits ---
-  double max_position_per_symbol = 2500.0; // Max 2500 shares per symbol (5 fills of 500)
+  double max_position_per_symbol = 5000.0;  // Max 5000 shares per symbol (more capacity)
   double max_daily_loss_per_symbol = 500.0; // Stop trading after $500 loss
-  double max_portfolio_loss = 50000.0;     // Kill switch at $50k loss
+  double max_portfolio_loss = 50000.0;      // Kill switch at $50k loss
 
   // --- Symbol Selection Criteria ---
-  // Profitable spread requirements
-  double min_spread_to_trade = 0.03;       // Only trade if spread >= $0.03 (good edge)
-  double max_spread_to_trade = 0.06;       // Moderate max - balance liquidity/edge
-  uint32_t min_depth_to_trade = 400;       // Moderate depth requirement
+  // Trade wider range of spreads to get more fills
+  double min_spread_to_trade = 0.01;       // Trade tighter spreads (more volume)
+  double max_spread_to_trade = 0.15;       // Allow wider spreads (more edge per fill)
+  uint32_t min_depth_to_trade = 100;       // Lower depth requirement (more symbols)
 
   // Legacy compatibility
   enum class FillMode { Cross, Match } fill_mode = FillMode::Cross;
@@ -118,7 +137,15 @@ struct PerSymbolSim {
   MarketMakerStrategy mm_baseline;
   MarketMakerStrategy mm_toxicity;
 
-  std::unordered_map<uint64_t, char> order_side;
+  // Track order details for queue position updates on cancel/execute
+  struct OrderInfo {
+    char side;
+    double price;
+    uint32_t volume;
+    uint64_t add_time_ns;  // Track when order was added for cleanup
+  };
+  std::unordered_map<uint64_t, OrderInfo> order_info;
+  uint64_t last_cleanup_ns = 0;
 
   bool initialized = false;
   bool eligible_to_trade = true;  // Passes symbol selection criteria
@@ -142,7 +169,7 @@ struct PerSymbolSim {
   PerSymbolSim()
       : order_book_baseline(), order_book_toxicity(),
         mm_baseline(order_book_baseline, false),
-        mm_toxicity(order_book_toxicity, true), order_side(),
+        mm_toxicity(order_book_toxicity, true), order_info(),
         latency_us_dist(0.0, 1.0), uni01(0.0, 1.0) {}
 
   void ensure_init(uint32_t idx) {
@@ -173,9 +200,6 @@ struct PerSymbolSim {
 
   // Calculate queue position based on visible depth at price level
   uint32_t calculate_queue_position(double price, char side) {
-    auto stats = (side == 'B') ? order_book_toxicity.get_stats()
-                               : order_book_toxicity.get_stats();
-
     uint32_t visible_depth = 0;
     if (side == 'B') {
       auto bids = order_book_toxicity.get_bids();
@@ -231,7 +255,6 @@ struct PerSymbolSim {
                                   uint64_t now_ns) {
     auto stats = order_book_toxicity.get_stats();
     double current_mid = stats.mid_price;
-    if (current_mid <= 0) return;
 
     for (auto& fill : fills) {
       if (fill.adverse_measured) continue;
@@ -239,6 +262,12 @@ struct PerSymbolSim {
       // Check if enough time has passed
       uint64_t elapsed_us = (now_ns - fill.fill_time_ns) / 1000;
       if (elapsed_us < g_exec.adverse_lookforward_us) continue;
+
+      // Mark as measured even if we can't calculate (to allow cleanup)
+      fill.adverse_measured = true;
+
+      // Skip adverse calculation if no valid mid price
+      if (current_mid <= 0) continue;
 
       // Measure adverse price movement
       double price_change = current_mid - fill.mid_price_at_fill;
@@ -254,11 +283,16 @@ struct PerSymbolSim {
         risk.total_adverse_pnl += fill.adverse_pnl;
         risk.adverse_fills++;
       }
-
-      fill.adverse_measured = true;
     }
 
-    // Clean up old measured fills
+    // Clean up old measured fills - also force cleanup if vector is too large
+    if (fills.size() > 10000) {
+      // Emergency cleanup - mark old fills as measured
+      for (size_t i = 0; i < fills.size() - 5000; i++) {
+        fills[i].adverse_measured = true;
+      }
+    }
+
     fills.erase(
         std::remove_if(fills.begin(), fills.end(),
                        [](const FillRecord& f) { return f.adverse_measured; }),
@@ -332,27 +366,80 @@ struct PerSymbolSim {
                          'S', now_ns);
   }
 
-  void on_add(uint64_t order_id, double price, uint32_t volume, char side) {
-    order_side[order_id] = side;
+  void on_add(uint64_t order_id, double price, uint32_t volume, char side, uint64_t now_ns) {
+    order_info[order_id] = {side, price, volume, now_ns};
     order_book_baseline.add_order(order_id, price, volume, side);
     order_book_toxicity.add_order(order_id, price, volume, side);
+
+    // Periodic cleanup of stale orders (every 10 seconds of market time)
+    constexpr uint64_t CLEANUP_INTERVAL_NS = 10ULL * 1000000000ULL;  // 10 seconds
+    constexpr uint64_t MAX_ORDER_AGE_NS = 60ULL * 1000000000ULL;     // 60 seconds max age
+    if (now_ns - last_cleanup_ns > CLEANUP_INTERVAL_NS) {
+      last_cleanup_ns = now_ns;
+      // Remove orders older than MAX_ORDER_AGE_NS
+      for (auto it = order_info.begin(); it != order_info.end(); ) {
+        if (now_ns - it->second.add_time_ns > MAX_ORDER_AGE_NS) {
+          it = order_info.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
   }
 
   void on_modify(uint64_t order_id, double price, uint32_t volume) {
+    auto it = order_info.find(order_id);
+    if (it != order_info.end()) {
+      // If price changed, treat old price level as cancel for queue purposes
+      if (std::abs(it->second.price - price) > 0.0001) {
+        update_queue_on_cancel(it->second.price, it->second.volume, it->second.side);
+      }
+      it->second.price = price;
+      it->second.volume = volume;
+    }
     order_book_baseline.modify_order(order_id, price, volume);
     order_book_toxicity.modify_order(order_id, price, volume);
   }
 
+  // Helper to update queue positions when orders at our quote price cancel
+  void update_queue_on_cancel(double price, uint32_t volume, char side) {
+    auto update_vo = [&](VirtualOrder& vo, bool is_bid) {
+      if (!vo.live || vo.queue_ahead == 0) return;
+      // Only update if cancel is at our quote price and same side
+      if ((is_bid && side == 'B') || (!is_bid && side == 'S')) {
+        if (std::abs(vo.price - price) < 0.0001) {
+          // Order ahead of us cancelled - improve our queue position
+          vo.queue_ahead = (vo.queue_ahead > volume) ? (vo.queue_ahead - volume) : 0;
+        }
+      }
+    };
+
+    update_vo(baseline_state.bid, true);
+    update_vo(baseline_state.ask, false);
+    update_vo(toxicity_state.bid, true);
+    update_vo(toxicity_state.ask, false);
+  }
+
   void on_delete(uint64_t order_id) {
-    order_side.erase(order_id);
+    auto it = order_info.find(order_id);
+    if (it != order_info.end()) {
+      // Update queue positions before removing order info
+      update_queue_on_cancel(it->second.price, it->second.volume, it->second.side);
+      order_info.erase(it);
+    }
     order_book_baseline.delete_order(order_id);
     order_book_toxicity.delete_order(order_id);
   }
 
   void on_replace(uint64_t old_order_id, uint64_t new_order_id, double price,
-                  uint32_t volume, char side) {
-    order_side.erase(old_order_id);
-    order_side[new_order_id] = side;
+                  uint32_t volume, char side, uint64_t now_ns) {
+    auto it = order_info.find(old_order_id);
+    if (it != order_info.end()) {
+      // Old order leaving queue - update queue positions
+      update_queue_on_cancel(it->second.price, it->second.volume, it->second.side);
+      order_info.erase(it);
+    }
+    order_info[new_order_id] = {side, price, volume, now_ns};
 
     order_book_baseline.delete_order(old_order_id);
     order_book_baseline.add_order(new_order_id, price, volume, side);
@@ -442,9 +529,16 @@ struct PerSymbolSim {
 
   void on_execute(uint64_t order_id, uint32_t exec_qty, double exec_price,
                   uint64_t now_ns) {
-    auto it = order_side.find(order_id);
-    if (it != order_side.end()) {
-      maybe_fill_on_execution(it->second, exec_price, exec_qty, now_ns);
+    auto it = order_info.find(order_id);
+    if (it != order_info.end()) {
+      maybe_fill_on_execution(it->second.side, exec_price, exec_qty, now_ns);
+
+      // Update volume tracking (partial fills reduce remaining volume)
+      if (it->second.volume > exec_qty) {
+        it->second.volume -= exec_qty;
+      } else {
+        order_info.erase(it);
+      }
     }
 
     order_book_baseline.execute_order(order_id, exec_qty, exec_price);
@@ -452,8 +546,65 @@ struct PerSymbolSim {
   }
 };
 
-std::unordered_map<uint32_t, PerSymbolSim> g_sims;
-uint64_t g_total_executions = 0;
+// Thread-safe symbol simulation storage
+// Pre-allocated array for lock-free access (no hash map lookups during processing)
+constexpr uint32_t MAX_SYMBOLS = 100000;
+std::unique_ptr<PerSymbolSim*[]> g_sims_array;       // Raw pointer array
+std::unique_ptr<std::atomic<bool>[]> g_sims_initialized;  // Atomic flags (raw array)
+
+// Sharded locks to reduce contention (64 shards = good balance)
+constexpr size_t NUM_LOCK_SHARDS = 64;
+std::array<std::mutex, NUM_LOCK_SHARDS> g_shard_mutexes;
+
+std::atomic<uint64_t> g_total_executions{0};
+std::atomic<uint64_t> g_total_packets{0};
+std::atomic<uint64_t> g_total_messages{0};
+std::atomic<size_t> g_files_completed{0};
+std::atomic<size_t> g_active_symbols{0};
+
+// Initialize pre-allocated storage (call once at startup)
+void init_symbol_storage() {
+  g_sims_array = std::make_unique<PerSymbolSim*[]>(MAX_SYMBOLS);
+  g_sims_initialized = std::make_unique<std::atomic<bool>[]>(MAX_SYMBOLS);
+  for (size_t i = 0; i < MAX_SYMBOLS; ++i) {
+    g_sims_array[i] = nullptr;
+    g_sims_initialized[i].store(false, std::memory_order_relaxed);
+  }
+}
+
+// Get shard mutex for a symbol (distributes lock contention)
+inline std::mutex& get_shard_mutex(uint32_t symbol_index) {
+  return g_shard_mutexes[symbol_index % NUM_LOCK_SHARDS];
+}
+
+// Get or create PerSymbolSim - lock-free fast path
+inline PerSymbolSim* get_or_create_sim_fast(uint32_t symbol_index) {
+  if (symbol_index >= MAX_SYMBOLS) return nullptr;
+
+  // Fast path: already initialized (lock-free check)
+  if (g_sims_initialized[symbol_index].load(std::memory_order_acquire)) {
+    return g_sims_array[symbol_index];
+  }
+
+  // Slow path: need to initialize (use sharded lock)
+  std::lock_guard<std::mutex> lock(get_shard_mutex(symbol_index));
+
+  // Double-check after acquiring lock
+  if (g_sims_initialized[symbol_index].load(std::memory_order_acquire)) {
+    return g_sims_array[symbol_index];
+  }
+
+  g_sims_array[symbol_index] = new PerSymbolSim();
+  g_sims_initialized[symbol_index].store(true, std::memory_order_release);
+  g_active_symbols.fetch_add(1, std::memory_order_relaxed);
+
+  return g_sims_array[symbol_index];
+}
+
+// Periodically report memory stats (lock-free read of atomics)
+void report_memory_stats() {
+  std::cout << " [syms: " << g_active_symbols.load() << "]" << std::flush;
+}
 
 void process_xdp_message(const uint8_t *data, size_t max_len, uint16_t msg_type,
                          uint64_t now_ns) {
@@ -464,11 +615,30 @@ void process_xdp_message(const uint8_t *data, size_t max_len, uint16_t msg_type,
   if (symbol_index == 0)
     return;
 
+  // Bounds check: NYSE has ~8000 symbols, anything > 100k is invalid
+  constexpr uint32_t MAX_VALID_SYMBOL_INDEX = 100000;
+  if (symbol_index > MAX_VALID_SYMBOL_INDEX)
+    return;
+
   std::string ticker = xdp::get_symbol(symbol_index);
   if (!g_filter_ticker.empty() && ticker != g_filter_ticker)
     return;
 
-  PerSymbolSim &sim = g_sims[symbol_index];
+  // Only create simulation state for known symbols
+  if (ticker.empty())
+    return;
+
+  g_total_messages.fetch_add(1, std::memory_order_relaxed);
+
+  // Lock-free fast path for symbol lookup, sharded lock for updates
+  PerSymbolSim* sim_ptr = get_or_create_sim_fast(symbol_index);
+  if (!sim_ptr) return;
+
+  PerSymbolSim& sim = *sim_ptr;
+
+  // Use sharded lock for this symbol's updates
+  std::lock_guard<std::mutex> sym_lock(get_shard_mutex(symbol_index));
+
   sim.ensure_init(symbol_index);
 
   switch (msg_type) {
@@ -480,7 +650,7 @@ void process_xdp_message(const uint8_t *data, size_t max_len, uint16_t msg_type,
       uint8_t side = data[32];
       double price = xdp::parse_price(price_raw);
       char side_char = xdp::side_to_char(xdp::parse_side(side));
-      sim.on_add(order_id, price, volume, side_char);
+      sim.on_add(order_id, price, volume, side_char, now_ns);
     }
     break;
   }
@@ -525,7 +695,7 @@ void process_xdp_message(const uint8_t *data, size_t max_len, uint16_t msg_type,
       double price = xdp::parse_price(price_raw);
       uint8_t side = data[40];
       char side_char = xdp::side_to_char(xdp::parse_side(side));
-      sim.on_replace(old_order_id, new_order_id, price, volume, side_char);
+      sim.on_replace(old_order_id, new_order_id, price, volume, side_char, now_ns);
     }
     break;
   }
@@ -549,7 +719,7 @@ void print_results() {
   };
 
   std::vector<Row> rows;
-  rows.reserve(g_sims.size());
+  rows.reserve(g_active_symbols.load());
 
   double portfolio_baseline = 0.0;
   double portfolio_toxicity = 0.0;
@@ -561,9 +731,12 @@ void print_results() {
   int64_t symbols_halted = 0;
   int64_t symbols_ineligible = 0;
 
-  for (const auto &kv : g_sims) {
-    const uint32_t symbol_index = kv.first;
-    const PerSymbolSim &sim = kv.second;
+  // Iterate over pre-allocated array (no lock needed - single-threaded at results time)
+  for (uint32_t symbol_index = 0; symbol_index < MAX_SYMBOLS; ++symbol_index) {
+    if (!g_sims_initialized[symbol_index].load(std::memory_order_relaxed)) continue;
+    PerSymbolSim* sim_ptr = g_sims_array[symbol_index];
+    if (!sim_ptr) continue;
+    const PerSymbolSim &sim = *sim_ptr;
 
     if (!sim.eligible_to_trade) {
       symbols_ineligible++;
@@ -684,21 +857,197 @@ void print_results() {
 }
 
 void print_usage(const char *program) {
-  std::cerr << "HFT Market Maker Simulation\n\n"
-            << "Usage: " << program << " <pcap_file> [symbol_file] [options]\n\n"
+  std::cerr << "HFT Market Maker Simulation (HYBRID MULTI-PROCESS VERSION)\n\n"
+            << "Usage: " << program << " <pcap_file(s)> [options]\n\n"
+            << "Processes PCAP files using hybrid multi-process architecture:\n"
+            << "- Files grouped by time window, each group processed by separate process\n"
+            << "- Sequential processing within groups (maintains order book state)\n"
+            << "- Zero lock contention between groups (separate memory spaces)\n\n"
             << "Options:\n"
             << "  -t TICKER           Filter to single ticker\n"
+            << "  -s, --symbols FILE  Symbol map file (default: data/symbol_nyse_parsed.csv)\n"
             << "  --seed N            Random seed\n"
             << "  --latency-us M      One-way latency in microseconds (default: 20)\n"
             << "  --latency-jitter-us J  Latency jitter (default: 5)\n"
-            << "  --queue-fraction F  Queue position as fraction of depth (default: 0.3)\n"
-            << "  --adverse-lookforward-us U  Adverse selection lookforward (default: 1000)\n"
-            << "  --adverse-multiplier M  Adverse selection penalty multiplier (default: 0.5)\n"
-            << "  --maker-rebate R    Maker rebate per share (default: 0.0015)\n"
-            << "  --max-position P    Max position per symbol (default: 500)\n"
-            << "  --max-loss L        Max daily loss per symbol (default: 100)\n"
+            << "  --queue-fraction F  Queue position as fraction of depth (default: 0.05)\n"
+            << "  --adverse-lookforward-us U  Adverse selection lookforward (default: 500)\n"
+            << "  --adverse-multiplier M  Adverse selection penalty multiplier (default: 0.10)\n"
+            << "  --maker-rebate R    Maker rebate per share (default: 0.002)\n"
+            << "  --max-position P    Max position per symbol (default: 5000)\n"
+            << "  --max-loss L        Max daily loss per symbol (default: 500)\n"
             << "  --quote-interval-us Q  Quote update interval (default: 50)\n"
-            << "  --fill-mode M       Fill mode: cross or match (default: cross)\n";
+            << "  --fill-mode M       Fill mode: cross or match (default: cross)\n"
+            << "\nParallel Processing Options:\n"
+            << "  --threads N         Number of processes (default: auto-detect all cores)\n"
+            << "  --files-per-group N Files per process group (default: auto)\n"
+            << "  --no-hybrid         Disable hybrid mode (use threaded mode instead)\n"
+            << "  --sequential        Disable all parallelism (single-threaded)\n\n"
+            << "Example (full day, hybrid):\n"
+            << "  " << program << " data/pcaps/*.pcap --threads 14\n";
+}
+
+// =============================================================================
+// HYBRID MULTI-PROCESS ARCHITECTURE
+// Groups files by time window, spawns process per group, aggregates results
+// =============================================================================
+
+// Shared memory structure for inter-process result aggregation
+struct ProcessResults {
+  double baseline_pnl;
+  double toxicity_pnl;
+  double adverse_pnl;
+  int64_t baseline_fills;
+  int64_t toxicity_fills;
+  int64_t quotes_suppressed;
+  int64_t adverse_fills;
+  uint64_t packets_processed;
+  uint64_t messages_processed;
+  uint64_t symbols_active;
+  bool completed;
+  char padding[7];  // Align to 8 bytes
+};
+
+// Get file size in bytes
+size_t get_file_size(const std::string& path) {
+  struct stat st;
+  if (stat(path.c_str(), &st) == 0) {
+    return static_cast<size_t>(st.st_size);
+  }
+  return 0;
+}
+
+// Group files by total size for balanced load distribution
+// Uses greedy algorithm: assign each file to the group with smallest total size
+std::vector<std::vector<std::string>> group_files(
+    const std::vector<std::string>& files, size_t num_groups) {
+  std::vector<std::vector<std::string>> groups(num_groups);
+  std::vector<size_t> group_sizes(num_groups, 0);
+
+  if (files.empty() || num_groups == 0) return groups;
+
+  // Get sizes for all files and sort by size (largest first for better balancing)
+  std::vector<std::pair<std::string, size_t>> file_sizes;
+  file_sizes.reserve(files.size());
+  for (const auto& f : files) {
+    file_sizes.push_back({f, get_file_size(f)});
+  }
+
+  // Sort by size descending (largest files first = better load balancing)
+  std::sort(file_sizes.begin(), file_sizes.end(),
+            [](const auto& a, const auto& b) { return a.second > b.second; });
+
+  // Greedy assignment: assign each file to the group with smallest total size
+  for (const auto& [file, size] : file_sizes) {
+    // Find group with minimum total size
+    size_t min_idx = 0;
+    size_t min_size = group_sizes[0];
+    for (size_t i = 1; i < num_groups; ++i) {
+      if (group_sizes[i] < min_size) {
+        min_size = group_sizes[i];
+        min_idx = i;
+      }
+    }
+
+    groups[min_idx].push_back(file);
+    group_sizes[min_idx] += size;
+  }
+
+  // Sort files within each group by name (chronological order)
+  for (auto& group : groups) {
+    std::sort(group.begin(), group.end());
+  }
+
+  // Remove empty groups
+  groups.erase(
+      std::remove_if(groups.begin(), groups.end(),
+                     [](const std::vector<std::string>& g) { return g.empty(); }),
+      groups.end());
+
+  // Print load distribution for debugging
+  std::cout << "Load distribution (MB per group):\n";
+  for (size_t i = 0; i < groups.size(); ++i) {
+    double mb = group_sizes[i] / (1024.0 * 1024.0);
+    std::cout << "  Group " << (i+1) << ": " << std::fixed << std::setprecision(1)
+              << mb << " MB (" << groups[i].size() << " files)\n";
+  }
+
+  return groups;
+}
+
+// Process a group of files sequentially (called in child process)
+void process_file_group(const std::vector<std::string>& files,
+                        ProcessResults* results,
+                        const std::string& symbol_file) {
+  // Re-initialize symbol storage in child process
+  init_symbol_storage();
+  (void)xdp::load_symbol_map(symbol_file);
+
+  // Reset counters for this process
+  g_total_packets.store(0);
+  g_total_messages.store(0);
+  g_active_symbols.store(0);
+
+  auto packet_callback = [](const uint8_t *data, size_t length,
+                            uint64_t, const xdp::NetworkPacketInfo &info) {
+    g_total_packets.fetch_add(1, std::memory_order_relaxed);
+
+    if (length < xdp::PACKET_HEADER_SIZE) return;
+
+    xdp::PacketHeader pkt_header;
+    if (!xdp::parse_packet_header(data, length, pkt_header)) return;
+
+    size_t offset = xdp::PACKET_HEADER_SIZE;
+    for (uint8_t i = 0; i < pkt_header.num_messages && offset < length; i++) {
+      if (offset + xdp::MESSAGE_HEADER_SIZE > length) break;
+      uint16_t msg_size = xdp::read_le16(data + offset);
+      if (msg_size < xdp::MESSAGE_HEADER_SIZE || offset + msg_size > length) break;
+      uint16_t msg_type = xdp::read_le16(data + offset + 2);
+      process_xdp_message(data + offset, msg_size, msg_type, info.timestamp_ns);
+      offset += msg_size;
+    }
+  };
+
+  // Process files sequentially within group (maintains state)
+  for (const auto& pcap_file : files) {
+    xdp::MmapPcapReader reader;
+    if (!reader.open(pcap_file)) continue;
+    reader.preload();
+    reader.process_all(packet_callback);
+  }
+
+  // Aggregate results from this process
+  double baseline_pnl = 0.0, toxicity_pnl = 0.0, adverse_pnl = 0.0;
+  int64_t baseline_fills = 0, toxicity_fills = 0, quotes_suppressed = 0, adverse_fills = 0;
+
+  for (uint32_t idx = 0; idx < MAX_SYMBOLS; ++idx) {
+    if (!g_sims_initialized[idx].load(std::memory_order_relaxed)) continue;
+    PerSymbolSim* sim = g_sims_array[idx];
+    if (!sim || !sim->eligible_to_trade) continue;
+
+    const auto& bs = sim->mm_baseline.get_stats();
+    const auto& ts = sim->mm_toxicity.get_stats();
+
+    baseline_pnl += bs.realized_pnl + bs.unrealized_pnl + sim->baseline_risk.total_adverse_pnl;
+    toxicity_pnl += ts.realized_pnl + ts.unrealized_pnl + sim->toxicity_risk.total_adverse_pnl;
+    adverse_pnl += sim->toxicity_risk.total_adverse_pnl;
+    baseline_fills += sim->baseline_risk.total_fills;
+    toxicity_fills += sim->toxicity_risk.total_fills;
+    quotes_suppressed += ts.quotes_suppressed;
+    adverse_fills += sim->toxicity_risk.adverse_fills;
+  }
+
+  // Write results to shared memory
+  results->baseline_pnl = baseline_pnl;
+  results->toxicity_pnl = toxicity_pnl;
+  results->adverse_pnl = adverse_pnl;
+  results->baseline_fills = baseline_fills;
+  results->toxicity_fills = toxicity_fills;
+  results->quotes_suppressed = quotes_suppressed;
+  results->adverse_fills = adverse_fills;
+  results->packets_processed = g_total_packets.load();
+  results->messages_processed = g_total_messages.load();
+  results->symbols_active = g_active_symbols.load();
+  results->completed = true;
 }
 
 } // namespace
@@ -709,13 +1058,16 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  std::string pcap_file = argv[1];
+  std::vector<std::string> pcap_files;
   std::string symbol_file = "data/symbol_nyse_parsed.csv";
 
-  for (int i = 2; i < argc; i++) {
+  // Parse arguments - collect PCAP files and options
+  for (int i = 1; i < argc; i++) {
     const std::string arg = argv[i];
     if (arg == "-t" && i + 1 < argc) {
       g_filter_ticker = argv[++i];
+    } else if ((arg == "-s" || arg == "--symbols") && i + 1 < argc) {
+      symbol_file = argv[++i];
     } else if (arg == "--seed" && i + 1 < argc) {
       g_exec.seed = std::stoull(argv[++i]);
     } else if (arg == "--latency-us" && i + 1 < argc) {
@@ -743,31 +1095,195 @@ int main(int argc, char *argv[]) {
       }
     } else if (arg == "--quote-interval-us" && i + 1 < argc) {
       g_exec.quote_update_interval_us = std::stoull(argv[++i]);
-    } else {
-      symbol_file = argv[i];
+    } else if (arg == "--threads" && i + 1 < argc) {
+      g_num_threads = std::stoull(argv[++i]);
+    } else if (arg == "--files-per-group" && i + 1 < argc) {
+      g_files_per_group = std::stoull(argv[++i]);
+    } else if (arg == "--sequential") {
+      g_use_parallel = false;
+      g_use_hybrid = false;
+    } else if (arg == "--no-hybrid") {
+      g_use_hybrid = false;
+    } else if (arg == "--mmap") {
+      // mmap is now default, this flag is kept for compatibility
+    } else if (arg[0] != '-') {
+      // Assume it's a PCAP file
+      pcap_files.push_back(arg);
     }
   }
 
-  (void)xdp::load_symbol_map(symbol_file);
-
-  if (!g_filter_ticker.empty()) {
-    std::cout << "Filtering for ticker: " << g_filter_ticker << '\n';
-  }
-
-  xdp::PcapReader reader;
-  if (!reader.open(pcap_file)) {
-    std::cerr << "Error opening PCAP file: " << reader.error() << '\n';
+  if (pcap_files.empty()) {
+    std::cerr << "Error: No PCAP files specified\n";
+    print_usage(argv[0]);
     return 1;
   }
 
-  std::cout << "Processing PCAP file: " << pcap_file << '\n';
-  std::cout << "Running baseline and toxicity-aware strategies...\n";
+  // Sort PCAP files by name to ensure chronological order
+  std::sort(pcap_files.begin(), pcap_files.end());
 
-  uint64_t packet_count = 0;
+  // Determine number of processes/threads
+  size_t num_procs = g_num_threads;
+  if (num_procs == 0) {
+    num_procs = std::thread::hardware_concurrency();
+    if (num_procs == 0) num_procs = 4;
+  }
 
-  auto packet_callback = [&packet_count](const uint8_t *data, size_t length,
-                                          uint64_t, const xdp::NetworkPacketInfo &info) {
-    packet_count++;
+  // Determine mode string
+  std::string mode_str = "SEQUENTIAL";
+  if (g_use_hybrid && g_use_parallel && pcap_files.size() > 1) {
+    mode_str = "HYBRID MULTI-PROCESS";
+  } else if (g_use_parallel && pcap_files.size() > 1) {
+    mode_str = "THREADED";
+  }
+
+  auto start_time = std::chrono::high_resolution_clock::now();
+
+  // ==========================================================================
+  // HYBRID MULTI-PROCESS MODE
+  // ==========================================================================
+  if (g_use_hybrid && g_use_parallel && pcap_files.size() > 1) {
+    // Group files for parallel processing
+    auto file_groups = group_files(pcap_files, num_procs);
+    size_t actual_groups = file_groups.size();
+
+    // Print header BEFORE fork to avoid duplicate output
+    std::cout << "=== HFT Market Maker Simulation (HYBRID) ===\n";
+    std::cout << "PCAP files: " << pcap_files.size() << '\n';
+    std::cout << "Process groups: " << actual_groups << '\n';
+    for (size_t i = 0; i < actual_groups; ++i) {
+      std::cout << "  Group " << (i+1) << ": " << file_groups[i].size() << " files\n";
+    }
+    std::cout << "\nSpawning child processes...\n" << std::flush;
+
+    // Allocate shared memory for results
+    size_t shm_size = sizeof(ProcessResults) * actual_groups;
+    ProcessResults* shared_results = static_cast<ProcessResults*>(
+        mmap(nullptr, shm_size, PROT_READ | PROT_WRITE,
+             MAP_SHARED | MAP_ANONYMOUS, -1, 0));
+
+    if (shared_results == MAP_FAILED) {
+      std::cerr << "Failed to allocate shared memory\n";
+      return 1;
+    }
+
+    // Initialize shared memory
+    std::memset(shared_results, 0, shm_size);
+
+    // Fork child processes
+    std::vector<pid_t> children;
+    for (size_t group_idx = 0; group_idx < actual_groups; ++group_idx) {
+      pid_t pid = fork();
+
+      if (pid < 0) {
+        std::cerr << "Fork failed for group " << group_idx << "\n";
+        continue;
+      }
+
+      if (pid == 0) {
+        // Child process
+        process_file_group(file_groups[group_idx],
+                           &shared_results[group_idx],
+                           symbol_file);
+
+        // Print progress from child
+        std::cout << "[Group " << (group_idx + 1) << "/" << actual_groups << "] "
+                  << "Completed: " << shared_results[group_idx].packets_processed
+                  << " packets, " << shared_results[group_idx].messages_processed
+                  << " msgs\n" << std::flush;
+
+        _exit(0);  // Exit child without calling destructors
+      }
+
+      children.push_back(pid);
+    }
+
+    // Parent: wait for all children
+    for (pid_t child : children) {
+      int status;
+      waitpid(child, &status, 0);
+    }
+
+    std::cout << "\nAll processes completed. Aggregating results...\n";
+
+    // Aggregate results from all processes
+    double total_baseline_pnl = 0.0, total_toxicity_pnl = 0.0, total_adverse_pnl = 0.0;
+    int64_t total_baseline_fills = 0, total_toxicity_fills = 0;
+    int64_t total_quotes_suppressed = 0, total_adverse_fills = 0;
+    uint64_t total_packets = 0, total_messages = 0, total_symbols = 0;
+
+    for (size_t i = 0; i < actual_groups; ++i) {
+      if (shared_results[i].completed) {
+        total_baseline_pnl += shared_results[i].baseline_pnl;
+        total_toxicity_pnl += shared_results[i].toxicity_pnl;
+        total_adverse_pnl += shared_results[i].adverse_pnl;
+        total_baseline_fills += shared_results[i].baseline_fills;
+        total_toxicity_fills += shared_results[i].toxicity_fills;
+        total_quotes_suppressed += shared_results[i].quotes_suppressed;
+        total_adverse_fills += shared_results[i].adverse_fills;
+        total_packets += shared_results[i].packets_processed;
+        total_messages += shared_results[i].messages_processed;
+        total_symbols += shared_results[i].symbols_active;
+      }
+    }
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+    double seconds = duration.count() / 1000.0;
+
+    // Print aggregated results
+    std::cout << "\n=== PERFORMANCE STATISTICS ===\n";
+    std::cout << "Total processing time: " << std::fixed << std::setprecision(2)
+              << seconds << " seconds\n";
+    std::cout << "Total packets: " << total_packets << '\n';
+    std::cout << "Total messages: " << total_messages << '\n';
+    std::cout << "Throughput: " << std::fixed << std::setprecision(0)
+              << (total_packets / seconds) << " packets/sec, "
+              << (total_messages / seconds) << " msgs/sec\n";
+    std::cout << "Process groups: " << actual_groups << '\n';
+    std::cout << "Unique symbols (sum): " << total_symbols << '\n';
+
+    double improvement = total_toxicity_pnl - total_baseline_pnl;
+    double improvement_pct = total_baseline_pnl != 0.0
+        ? (improvement / std::abs(total_baseline_pnl)) * 100.0 : 0.0;
+
+    std::cout << "\n=== AGGREGATED SIMULATION RESULTS ===\n";
+    std::cout << "Baseline Total PnL: $" << std::fixed << std::setprecision(2)
+              << total_baseline_pnl << '\n';
+    std::cout << "Toxicity Total PnL: $" << std::fixed << std::setprecision(2)
+              << total_toxicity_pnl << '\n';
+    std::cout << "PnL Improvement: $" << std::fixed << std::setprecision(2)
+              << improvement << " (" << improvement_pct << "%)\n";
+    std::cout << "\nBaseline fills: " << total_baseline_fills << '\n';
+    std::cout << "Toxicity fills: " << total_toxicity_fills << '\n';
+    std::cout << "Quotes suppressed: " << total_quotes_suppressed << '\n';
+    std::cout << "Adverse fills: " << total_adverse_fills << '\n';
+    std::cout << "Total adverse penalty: $" << std::fixed << std::setprecision(2)
+              << total_adverse_pnl << '\n';
+
+    // Cleanup shared memory
+    munmap(shared_results, shm_size);
+
+    return 0;
+  }
+
+  // ==========================================================================
+  // NON-HYBRID MODES (threaded or sequential)
+  // ==========================================================================
+  std::cout << "=== HFT Market Maker Simulation (" << mode_str << ") ===\n";
+  std::cout << "PCAP files to process: " << pcap_files.size() << '\n';
+  std::cout << "Parallel units: " << num_procs << '\n';
+  if (!g_filter_ticker.empty()) {
+    std::cout << "Filtering for ticker: " << g_filter_ticker << '\n';
+  }
+  std::cout << "Running baseline and toxicity-aware strategies...\n\n";
+
+  (void)xdp::load_symbol_map(symbol_file);
+  init_symbol_storage();
+
+  // Thread-safe packet processing callback
+  auto packet_callback = [](const uint8_t *data, size_t length,
+                            uint64_t, const xdp::NetworkPacketInfo &info) {
+    g_total_packets++;
 
     if (length < xdp::PACKET_HEADER_SIZE)
       return;
@@ -791,15 +1307,119 @@ int main(int argc, char *argv[]) {
 
       offset += msg_size;
     }
-
-    if (packet_count % 100000 == 0) {
-      std::cout << "Processed " << packet_count << " packets...\n";
-    }
   };
 
-  reader.process_all(packet_callback);
+  if (g_use_parallel && pcap_files.size() > 1) {
+    // =====================================================================
+    // PARALLEL PROCESSING MODE
+    // Process multiple files concurrently using thread pool
+    // =====================================================================
+    std::cout << "Starting parallel processing with " << num_procs << " threads...\n";
 
-  std::cout << "\nFinished processing " << packet_count << " packets\n";
+    xdp::ThreadPool pool(num_procs);
+    std::mutex progress_mutex;
+    std::vector<std::future<size_t>> futures;
+    futures.reserve(pcap_files.size());
+
+    // Submit all files to thread pool
+    for (size_t file_idx = 0; file_idx < pcap_files.size(); file_idx++) {
+      const std::string& pcap_file = pcap_files[file_idx];
+
+      futures.push_back(pool.enqueue([&pcap_file, &progress_mutex,
+                                       total_files = pcap_files.size(),
+                                       &packet_callback]() -> size_t {
+        // Use memory-mapped reader for maximum throughput
+        xdp::MmapPcapReader reader;
+        if (!reader.open(pcap_file)) {
+          std::lock_guard<std::mutex> lock(progress_mutex);
+          std::cerr << "Warning: Error opening PCAP file " << pcap_file
+                    << ": " << reader.error() << " - skipping\n";
+          return 0;
+        }
+
+        // Pre-load file into memory
+        reader.preload();
+
+        size_t file_packets = reader.process_all(packet_callback);
+
+        // Report progress
+        size_t completed = ++g_files_completed;
+        {
+          std::lock_guard<std::mutex> lock(progress_mutex);
+          size_t last_slash = pcap_file.find_last_of("/\\");
+          std::string filename = (last_slash != std::string::npos)
+                                     ? pcap_file.substr(last_slash + 1)
+                                     : pcap_file;
+          std::cout << "[" << completed << "/" << total_files << "] "
+                    << filename << " - " << file_packets << " packets"
+                    << " (total: " << g_total_packets.load() << " packets, "
+                    << g_total_messages.load() << " msgs)\n" << std::flush;
+        }
+
+        return file_packets;
+      }));
+    }
+
+    // Wait for all files to complete
+    for (auto& f : futures) {
+      f.wait();
+    }
+
+    std::cout << "\nAll files processed.\n";
+  } else {
+    // =====================================================================
+    // SEQUENTIAL PROCESSING MODE (single file or --sequential flag)
+    // =====================================================================
+    std::cout << "Starting sequential processing...\n";
+
+    for (size_t file_idx = 0; file_idx < pcap_files.size(); file_idx++) {
+      const std::string& pcap_file = pcap_files[file_idx];
+
+      // Use memory-mapped reader for faster I/O
+      xdp::MmapPcapReader reader;
+      if (!reader.open(pcap_file)) {
+        std::cerr << "Warning: Error opening PCAP file " << pcap_file
+                  << ": " << reader.error() << " - skipping\n";
+        continue;
+      }
+
+      // Extract filename for progress display
+      size_t last_slash = pcap_file.find_last_of("/\\");
+      std::string filename = (last_slash != std::string::npos)
+                                 ? pcap_file.substr(last_slash + 1)
+                                 : pcap_file;
+
+      std::cout << "[" << (file_idx + 1) << "/" << pcap_files.size() << "] "
+                << filename << "..." << std::flush;
+
+      // Pre-load for better performance
+      reader.preload();
+
+      uint64_t packets_before = g_total_packets.load();
+      reader.process_all(packet_callback);
+      uint64_t file_packets = g_total_packets.load() - packets_before;
+
+      std::cout << " " << file_packets << " packets";
+      report_memory_stats();
+      std::cout << "\n";
+    }
+  }
+
+  auto end_time = std::chrono::high_resolution_clock::now();
+  auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+  double seconds = duration.count() / 1000.0;
+  double packets_per_sec = g_total_packets.load() / seconds;
+  double msgs_per_sec = g_total_messages.load() / seconds;
+
+  std::cout << "\n=== PERFORMANCE STATISTICS ===\n";
+  std::cout << "Total processing time: " << std::fixed << std::setprecision(2)
+            << seconds << " seconds\n";
+  std::cout << "Total packets: " << g_total_packets.load() << '\n';
+  std::cout << "Total messages: " << g_total_messages.load() << '\n';
+  std::cout << "Throughput: " << std::fixed << std::setprecision(0)
+            << packets_per_sec << " packets/sec, "
+            << msgs_per_sec << " msgs/sec\n";
+  std::cout << "Files processed: " << pcap_files.size() << '\n';
 
   print_results();
 

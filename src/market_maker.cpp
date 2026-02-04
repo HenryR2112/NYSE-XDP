@@ -383,7 +383,7 @@ double MarketMakerStrategy::calculate_expected_pnl(double spread, double toxicit
 }
 
 bool MarketMakerStrategy::should_quote(double expected_pnl) const noexcept {
-  // Require positive expected PnL for profitability
-  // Tuned for profitability
-  return expected_pnl > 0.0018 && std::abs(inventory_) < max_position_;
+  // Require slightly positive expected PnL - lowered threshold for more fills
+  // while still filtering clearly unprofitable situations
+  return expected_pnl > 0.0005 && std::abs(inventory_) < max_position_;
 }
