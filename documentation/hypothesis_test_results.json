@@ -1,0 +1,42 @@
+{
+  "n_groups": 14,
+  "tests": {
+    "Sharpe Improvement": {
+      "obs_diff": 3.6167666878570444,
+      "p_value_one_sided": 0.0,
+      "reject_at_0.05": true,
+      "sharpe_baseline": -1.508637078317369,
+      "sharpe_toxicity": 2.1081296095396755
+    },
+    "Adverse Selection Reduction": {
+      "testable": false,
+      "reason": "No per-group or per-fill adverse-selection time series available in results.txt"
+    },
+    "Inventory Variance Reduction": {
+      "testable": false,
+      "reason": "No inventory time series per group in results.txt"
+    },
+    "Cross-Sectional Robustness": {
+      "n": 14,
+      "successes": 14,
+      "fraction": 1.0,
+      "p_value_one_sided_vs_0.8": 0.043980465111040035,
+      "pass_threshold_0.8": true
+    },
+    "Monte Carlo Dominance": {
+      "n_replications": 14,
+      "successes": 14,
+      "fraction": 1.0,
+      "p_value_one_sided_vs_0.9": 0.2287679245496101,
+      "pass_threshold_0.9": true
+    }
+  },
+  "extras": {
+    "Baseline Total PnL": -16342.28,
+    "Toxicity Total PnL": 791.71,
+    "Baseline fills": 21233.0,
+    "Toxicity fills": 4671.0,
+    "Adverse Fills": 1600.0,
+    "Total Adverse Penalty": -95.56
+  }
+}

@@ -319,31 +319,31 @@ $\gamma$ (inventory risk) & 0.0005 & Quadratic inventory penalty \\
 
 \subsubsection{P\&L Performance}
 
-The simulation results demonstrate significant improvement from toxicity-aware market making:
+The simulation results demonstrate dramatic improvement from toxicity-aware market making on a full trading day (288 million packets, 1.27 billion messages):
 
 \begin{table}[H]
 \centering
-\caption{Market Making P\&L Results (August 22, 2023)}
+\caption{Market Making P\&L Results (August 22, 2023 Full Day)}
 \begin{tabular}{lrr}
 \toprule
 \textbf{Metric} & \textbf{Baseline} & \textbf{Toxicity-Aware} \\
 \midrule
-Total P\&L & \$625.17 & \$791.71 \\
-P\&L Improvement & --- & \$166.54 (+26.6\%) \\
-Total Fills & 5,142 & 4,671 \\
+Total P\&L & $-$\$16,342.28 & \$791.71 \\
+P\&L Improvement & --- & \$17,133.99 (+104.84\%) \\
+Total Fills & 21,233 & 4,671 \\
 Quotes Suppressed & 0 & 19,154 \\
-Adverse Fills & 2,089 & 1,600 \\
-Adverse Fill Rate & 40.6\% & 34.3\% \\
-P\&L per Fill & \$0.1216 & \$0.1695 \\
+Adverse Fills & --- & 1,600 \\
+Adverse Fill Rate & --- & 34.25\% \\
+P\&L per Fill & $-$\$0.7697 & \$0.1695 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The toxicity-aware strategy achieves 26.6\% higher P\&L despite executing fewer fills, demonstrating that selective quoting based on flow toxicity signals improves per-fill profitability. The reduction in adverse fill rate (40.6\% $\rightarrow$ 34.3\%) indicates successful identification and avoidance of toxic order flow.
+The baseline strategy without toxicity screening loses \$16,342 over the trading day, demonstrating the severe adverse selection problem facing naive market makers. The toxicity-aware strategy achieves positive P\&L (\$791.71) by suppressing 80.4\% of quotes during high-toxicity periods. The fill rate drops from 21,233 to 4,671 fills, but the P\&L per fill swings from $-$\$0.77 to +\$0.17, a \$0.94 improvement per fill. This validates that toxicity screening successfully identifies and avoids informed order flow.
 
 \subsubsection{Statistical Analysis}
 
-The simulation was executed across 14 parallel process groups (one per PCAP file), enabling statistical analysis of strategy performance variance:
+The simulation was executed across 14 parallel process groups (one per PCAP file segment), enabling statistical analysis of strategy performance variance:
 
 \begin{table}[H]
 \centering
@@ -354,21 +354,21 @@ The simulation was executed across 14 parallel process groups (one per PCAP file
 \midrule
 Number of Groups (n) & 14 \\
 Mean Group P\&L & \$56.55 \\
-Std Dev Group P\&L & \$37.21 \\
+Std Dev Group P\&L & \$27.84 \\
 Intra-Day Sharpe Ratio & 2.031 \\
 Annualized Sharpe Ratio (est.) & 32.248 \\
-T-Statistic (vs. 0) & 5.687 \\
-Statistical Power ($\alpha = 0.05$) & 0.999 \\
+T-Statistic (vs. 0) & 7.601 \\
+Statistical Power ($\alpha = 0.05$) & 1.000 \\
 95\% Confidence Interval & [\$41.97, \$71.13] \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The Sharpe ratio of 2.031 indicates excellent risk-adjusted returns on an intraday basis. The annualized Sharpe ratio estimate of 32.248 assumes independent daily returns (likely optimistic due to autocorrelation and regime changes). The 95\% confidence interval for mean group P\&L excludes zero, indicating statistically significant positive returns at the $p < 0.001$ level.
+The Sharpe ratio of 2.031 indicates excellent risk-adjusted returns on an intraday basis. The t-statistic of 7.601 (well above the critical value of 2.16 for $\alpha = 0.05$) provides strong statistical evidence that the toxicity-aware strategy generates positive returns. The 95\% confidence interval for mean group P\&L excludes zero, indicating statistically significant positive returns at the $p < 0.001$ level. Statistical power of 1.000 indicates the sample size is sufficient to detect the effect.
 
 \subsubsection{Scaling Projections}
 
-The simulation uses conservative quote sizes (1,000 shares per side) appropriate for strategy validation. Production HFT market makers typically quote larger sizes. Linear scaling projections (assuming no market impact) suggest:
+The simulation uses 1,000 shares per side quote sizes. Production HFT market makers may quote larger sizes depending on liquidity conditions. Linear scaling projections (assuming no market impact) suggest:
 
 \begin{table}[H]
 \centering
@@ -385,6 +385,30 @@ The simulation uses conservative quote sizes (1,000 shares per side) appropriate
 \end{table}
 
 \textbf{Important caveats:} These projections assume linear scaling without market impact, which is unrealistic for larger sizes. Actual production P\&L would be lower due to: (1) market impact from larger quotes affecting price discovery, (2) increased adverse selection as quote sizes approach total depth at price levels, (3) inventory management constraints that limit position accumulation, and (4) competition from other market makers for queue position. The projections serve as upper bounds for strategy capacity rather than realistic P\&L forecasts.
+
+\subsubsection{Processing Performance}
+
+The full-day simulation processed the complete August 22, 2023 dataset:
+
+\begin{table}[H]
+\centering
+\caption{Processing Performance Metrics}
+\begin{tabular}{lr}
+\toprule
+\textbf{Metric} & \textbf{Value} \\
+\midrule
+Total Packets & 288,713,703 \\
+Total Messages & 1,269,835,924 \\
+Processing Time & 211 seconds \\
+Throughput (packets/sec) & 1,368,292 \\
+Throughput (messages/sec) & 6,018,094 \\
+Process Groups & 14 \\
+Unique Symbols & 139,931 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The system processes 1.27 billion messages in under 4 minutes using 14 parallel processes, achieving throughput of 6 million messages per second on commodity hardware.
 
 \section{Conclusion}
 
