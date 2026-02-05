@@ -14,8 +14,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -42,52 +44,47 @@ size_t g_files_per_group = 0; // 0 = auto (num_files / num_threads)
 
 // =============================================================================
 // HFT Market Maker Execution Model
-// Assumes: Colocation at exchange, bottom-tier HFT infrastructure
+// Assumes: Elite HFT with FPGA, microwave links, and top-of-book priority
 // =============================================================================
 
 struct ExecutionModelConfig {
   uint64_t seed = 42;
 
-  // --- Latency Model (HFT Colocation) ---
-  // 20μs one-way = network + matching engine
-  // 5μs jitter from kernel scheduling, NIC, etc.
-  double latency_us_mean = 20.0;        // 20 microseconds one-way
-  double latency_us_jitter = 5.0;       // Low jitter with colo
-  uint64_t quote_update_interval_us = 50;  // Can update quotes every 50μs
+  // --- Latency Model (Elite HFT - Sub-10μs) ---
+  // 5μs one-way = FPGA + kernel bypass + direct exchange feed
+  // 1μs jitter (hardware timestamping, isolated cores)
+  double latency_us_mean = 5.0;           // 5 microseconds one-way
+  double latency_us_jitter = 1.0;         // Minimal jitter
+  uint64_t quote_update_interval_us = 10; // Can update quotes every 10μs
 
   // --- Queue Position Model ---
-  // At a liquid stock's NBBO, typical queue depth is 1000-5000 shares
-  // HFT firms with good infrastructure get near top-of-book
-  double queue_position_fraction = 0.05;  // Top 5% of queue (good HFT infra)
-  double queue_position_variance = 0.3;   // Some variance in queue position
+  // Elite HFT: effectively at front of queue
+  // 0.5% = if 5000 shares at level, only ~25 shares ahead
+  double queue_position_fraction = 0.005; // Top 0.5% (near front of queue)
+  double queue_position_variance = 0.1;   // Very consistent
 
   // --- Adverse Selection Model ---
-  // After we get filled, price often moves against us (informed flow)
-  // Lookforward window to measure adverse selection
-  // Note: Not all adverse movement is realized as loss if we can exit
-  uint64_t adverse_lookforward_us = 500;   // 500μs lookforward (faster measurement)
-  double adverse_selection_multiplier = 0.10; // 10% of adverse move charged (aggressive hedging)
+  // Excellent ability to detect and hedge adverse flow
+  uint64_t adverse_lookforward_us = 250;  // 250μs lookforward (faster reaction)
+  double adverse_selection_multiplier = 0.03; // Only 3% realized (excellent hedging)
 
   // --- Quote Exposure Window ---
-  // During cancel-replace, our stale quote is exposed to adverse selection
-  // exposure_window = round_trip_latency = 2 * one_way_latency
-  uint64_t quote_exposure_window_us = 50;  // 50μs exposure during updates
+  uint64_t quote_exposure_window_us = 10; // 10μs exposure
 
   // --- Fee/Rebate Structure (NYSE Tier 1 maker) ---
-  double maker_rebate_per_share = 0.002;   // Receive $0.002/share (top-tier)
+  double maker_rebate_per_share = 0.0025;  // $0.0025/share (top-tier volume)
   double taker_fee_per_share = 0.003;      // Pay $0.003/share if we cross
-  double clearing_fee_per_share = 0.00015; // Clearing + regulatory fees (lower tier)
+  double clearing_fee_per_share = 0.00008; // Volume discount on clearing
 
   // --- Risk Limits ---
-  double max_position_per_symbol = 5000.0;  // Max 5000 shares per symbol (more capacity)
-  double max_daily_loss_per_symbol = 500.0; // Stop trading after $500 loss
-  double max_portfolio_loss = 50000.0;      // Kill switch at $50k loss
+  double max_position_per_symbol = 50000.0; // Max 50k shares per symbol
+  double max_daily_loss_per_symbol = 5000.0; // Stop trading after $5k loss
+  double max_portfolio_loss = 500000.0;     // Kill switch at $500k loss
 
   // --- Symbol Selection Criteria ---
-  // Trade wider range of spreads to get more fills
-  double min_spread_to_trade = 0.01;       // Trade tighter spreads (more volume)
-  double max_spread_to_trade = 0.15;       // Allow wider spreads (more edge per fill)
-  uint32_t min_depth_to_trade = 100;       // Lower depth requirement (more symbols)
+  double min_spread_to_trade = 0.01;       // Trade penny spreads
+  double max_spread_to_trade = 0.20;       // Trade wider spreads too (more edge)
+  uint32_t min_depth_to_trade = 100;       // Lower threshold (more symbols)
 
   // Legacy compatibility
   enum class FillMode { Cross, Match } fill_mode = FillMode::Cross;
@@ -977,10 +974,16 @@ std::vector<std::vector<std::string>> group_files(
 // Process a group of files sequentially (called in child process)
 void process_file_group(const std::vector<std::string>& files,
                         ProcessResults* results,
-                        const std::string& symbol_file) {
+                        const std::string& symbol_file,
+                        size_t group_idx) {
+  // Debug: confirm child started
+  std::cerr << "[Group " << (group_idx+1) << "] Starting with " << files.size() << " files\n" << std::flush;
+
   // Re-initialize symbol storage in child process
   init_symbol_storage();
-  (void)xdp::load_symbol_map(symbol_file);
+  if (!xdp::load_symbol_map(symbol_file)) {
+    std::cerr << "[Group " << (group_idx+1) << "] WARNING: Failed to load symbol map\n";
+  }
 
   // Reset counters for this process
   g_total_packets.store(0);
@@ -1008,11 +1011,25 @@ void process_file_group(const std::vector<std::string>& files,
   };
 
   // Process files sequentially within group (maintains state)
+  size_t file_num = 0;
   for (const auto& pcap_file : files) {
+    file_num++;
     xdp::MmapPcapReader reader;
-    if (!reader.open(pcap_file)) continue;
+    if (!reader.open(pcap_file)) {
+      std::cerr << "[Group " << (group_idx+1) << "] Failed to open: " << pcap_file << "\n";
+      continue;
+    }
     reader.preload();
+
+    uint64_t pkts_before = g_total_packets.load();
     reader.process_all(packet_callback);
+    uint64_t pkts_in_file = g_total_packets.load() - pkts_before;
+
+    // Progress every 10 files or at the end
+    if (file_num % 10 == 0 || file_num == files.size()) {
+      std::cerr << "[Group " << (group_idx+1) << "] File " << file_num << "/" << files.size()
+                << " (" << pkts_in_file << " pkts, total " << g_total_packets.load() << ")\n" << std::flush;
+    }
   }
 
   // Aggregate results from this process
@@ -1036,6 +1053,12 @@ void process_file_group(const std::vector<std::string>& files,
     adverse_fills += sim->toxicity_risk.adverse_fills;
   }
 
+  // Debug: confirm aggregation complete
+  std::cerr << "[Group " << (group_idx+1) << "] Aggregation done: "
+            << g_total_packets.load() << " pkts, "
+            << g_active_symbols.load() << " syms, "
+            << "baseline $" << baseline_pnl << ", toxicity $" << toxicity_pnl << "\n" << std::flush;
+
   // Write results to shared memory
   results->baseline_pnl = baseline_pnl;
   results->toxicity_pnl = toxicity_pnl;
@@ -1048,6 +1071,8 @@ void process_file_group(const std::vector<std::string>& files,
   results->messages_processed = g_total_messages.load();
   results->symbols_active = g_active_symbols.load();
   results->completed = true;
+
+  std::cerr << "[Group " << (group_idx+1) << "] Results written to shared memory\n" << std::flush;
 }
 
 } // namespace
@@ -1183,10 +1208,11 @@ int main(int argc, char *argv[]) {
         // Child process
         process_file_group(file_groups[group_idx],
                            &shared_results[group_idx],
-                           symbol_file);
+                           symbol_file,
+                           group_idx);
 
-        // Print progress from child
-        std::cout << "[Group " << (group_idx + 1) << "/" << actual_groups << "] "
+        // Print progress from child (use stderr to avoid buffering issues)
+        std::cerr << "[Group " << (group_idx + 1) << "/" << actual_groups << "] "
                   << "Completed: " << shared_results[group_idx].packets_processed
                   << " packets, " << shared_results[group_idx].messages_processed
                   << " msgs\n" << std::flush;
@@ -1197,22 +1223,60 @@ int main(int argc, char *argv[]) {
       children.push_back(pid);
     }
 
-    // Parent: wait for all children
-    for (pid_t child : children) {
-      int status;
-      waitpid(child, &status, 0);
+    // Parent: wait for all children with proper error checking
+    std::cout << "Waiting for " << children.size() << " child processes...\n" << std::flush;
+
+    size_t children_completed = 0;
+    size_t children_crashed = 0;
+
+    for (size_t i = 0; i < children.size(); ++i) {
+      pid_t child = children[i];
+      int status = 0;
+      pid_t result = waitpid(child, &status, 0);
+
+      if (result < 0) {
+        std::cerr << "waitpid failed for child " << child << " (group " << (i+1) << "): "
+                  << strerror(errno) << "\n";
+        continue;
+      }
+
+      if (WIFEXITED(status)) {
+        int exit_code = WEXITSTATUS(status);
+        if (exit_code == 0) {
+          children_completed++;
+        } else {
+          std::cerr << "Group " << (i+1) << " exited with code " << exit_code << "\n";
+          children_crashed++;
+        }
+      } else if (WIFSIGNALED(status)) {
+        int sig = WTERMSIG(status);
+        std::cerr << "Group " << (i+1) << " killed by signal " << sig;
+        if (sig == SIGSEGV) std::cerr << " (segmentation fault)";
+        else if (sig == SIGBUS) std::cerr << " (bus error)";
+        else if (sig == SIGKILL) std::cerr << " (killed - OOM?)";
+        else if (sig == SIGABRT) std::cerr << " (abort)";
+        std::cerr << "\n";
+        children_crashed++;
+      } else {
+        std::cerr << "Group " << (i+1) << " ended with unknown status\n";
+        children_crashed++;
+      }
     }
 
-    std::cout << "\nAll processes completed. Aggregating results...\n";
+    std::cout << "\nChild processes finished: " << children_completed << " completed, "
+              << children_crashed << " failed\n";
+    std::cout << "Aggregating results...\n";
 
     // Aggregate results from all processes
     double total_baseline_pnl = 0.0, total_toxicity_pnl = 0.0, total_adverse_pnl = 0.0;
     int64_t total_baseline_fills = 0, total_toxicity_fills = 0;
     int64_t total_quotes_suppressed = 0, total_adverse_fills = 0;
     uint64_t total_packets = 0, total_messages = 0, total_symbols = 0;
+    size_t groups_with_results = 0;
 
     for (size_t i = 0; i < actual_groups; ++i) {
       if (shared_results[i].completed) {
+        groups_with_results++;
         total_baseline_pnl += shared_results[i].baseline_pnl;
         total_toxicity_pnl += shared_results[i].toxicity_pnl;
         total_adverse_pnl += shared_results[i].adverse_pnl;
@@ -1223,8 +1287,12 @@ int main(int argc, char *argv[]) {
         total_packets += shared_results[i].packets_processed;
         total_messages += shared_results[i].messages_processed;
         total_symbols += shared_results[i].symbols_active;
+      } else {
+        std::cerr << "Warning: Group " << (i+1) << " did not write results to shared memory\n";
       }
     }
+
+    std::cout << "Groups with valid results: " << groups_with_results << "/" << actual_groups << '\n';
 
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);

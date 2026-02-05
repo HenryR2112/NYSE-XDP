@@ -1,24 +1,45 @@
-# Ignore data and build artifacts
-data/
-*.exe
+# Build artifacts
+build/
+cmake-build*/
 *.o
 *.obj
-*.out
-*.log
 *.a
 *.so
 *.dll
+*.exe
+*.out
 *.dSYM/
-build/
-cmake-build*/
-*.vcxproj*
+
+# IDE and editor
+.vscode/settings.json
 *.swp
-# clangd/compile_commands.json, etc.
+*.swo
+*~
+.idea/
+*.vcxproj*
+
+# Clangd and language server
 compile_commands.json
-.cache
-# Ignore macOS, Windows, and Linux system files
+.cache/
+.clangd/
+
+# Data files (large PCAP files, etc.)
+data/
+
+# Python virtual environment
+.venv/
+__pycache__/
+*.pyc
+
+# macOS
 .DS_Store
+
+# Windows
 Thumbs.db
-# End of Selection
-.venv
-```
+Desktop.ini
+
+# Linux
+*~
+
+# Logs
+*.log

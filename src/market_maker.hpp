@@ -90,30 +90,30 @@ private:
   std::unordered_map<uint64_t, bool> our_order_ids_;
   mutable std::mutex strategy_mutex_;
 
-  // Strategy parameters - REALISTIC HFT MM (optimized for fill volume + profitability)
-  // Balance between getting fills and avoiding adverse selection
-  double base_spread_ = 0.02;         // Tighter spread for more fills
+  // Strategy parameters - ELITE HFT MM (top-of-book priority)
+  // Assumes: Sub-5μs latency, front-of-queue, excellent flow prediction
+  double base_spread_ = 0.01;         // Penny spread at NBBO
   double min_spread_ = 0.01;          // Allow penny spread
-  double max_spread_ = 0.10;          // Allow wider in toxic conditions
-  uint32_t base_quote_size_ = 200;    // Smaller quotes = more fill opportunities
-  double max_position_ = 5000.0;      // Allow larger inventory (25 fills of 200)
+  double max_spread_ = 0.10;          // Moderate widening in toxic conditions
+  uint32_t base_quote_size_ = 1000;   // 1000 shares per side
+  double max_position_ = 100000.0;    // Max inventory: 100k shares
   double tick_size_ = 0.01;
 
-  double inventory_skew_coefficient_ = 0.08;  // Moderate inventory management
-  double toxicity_spread_multiplier_ = 2.0;   // Moderate toxicity response
-  double toxicity_quote_threshold_ = 0.55;    // Less aggressive filtering (more fills)
-  double obi_threshold_ = 0.35;               // Higher OBI threshold (less skipping)
+  double inventory_skew_coefficient_ = 0.02;  // Very gentle skew (excellent risk mgmt)
+  double toxicity_spread_multiplier_ = 1.0;   // Minimal spread widening
+  double toxicity_quote_threshold_ = 0.75;    // Very high threshold (almost always quote)
+  double obi_threshold_ = 0.50;               // Only skip on extreme OBI
 
   MarketMakerStats stats_;
 
-  // Strategy proposal parameters - calibrated for realistic fill rates
-  // Tuned to allow more fills while still filtering worst toxic flow
-  double alpha1_ = 1.5;   // Cancel rate weight (slightly lower)
-  double alpha2_ = 1.2;   // OBI weight - important predictor
-  double alpha3_ = 0.5;   // Short volatility weight
-  double mu_adverse_ = 0.008;  // Expected adverse movement (slightly lower)
-  double gamma_risk_ = 0.002;  // Lower inventory risk penalty
-  double fill_probability_ = 0.15;  // Higher fill probability expectation
+  // Strategy proposal parameters - calibrated for elite HFT
+  // Front-of-queue with excellent hedging = high fill rate, low adverse
+  double alpha1_ = 0.8;   // Lower cancel rate weight (confidence in speed)
+  double alpha2_ = 0.6;   // Lower OBI weight (can handle imbalance)
+  double alpha3_ = 0.3;   // Lower volatility weight
+  double mu_adverse_ = 0.003;  // Very low adverse expectation (excellent hedging)
+  double gamma_risk_ = 0.0005; // Very low inventory risk penalty
+  double fill_probability_ = 0.35;  // 35% expected fill rate (front of queue)
 
   // Rolling window for toxicity metrics
   struct ToxicityWindow {

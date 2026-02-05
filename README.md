@@ -78,9 +78,10 @@ Offset  Size  Field
 ## Building
 
 ### Prerequisites
-- C++11 compatible compiler (GCC, Clang)
-- CMake 3.10 or higher
+- C++17 compatible compiler (GCC 7+, Clang 5+)
+- CMake 3.14 or higher
 - libpcap development libraries
+- SDL2 (for visualization tools)
 
 ### macOS
 ```bash
@@ -102,7 +103,7 @@ make
 
 ### Build with g++ (direct)
 ```bash
-g++ -std=c++11 reader.cpp -lpcap -o reader
+g++ -std=c++17 -O3 src/reader.cpp src/common/symbol_map.cpp -I src -lpcap -o reader
 ```
 
 ## Usage
@@ -115,7 +116,7 @@ g++ -std=c++11 reader.cpp -lpcap -o reader
 ### Arguments
 - **pcap_file**: Path to PCAP file containing XDP data (required)
 - **verbose**: `0` = simplified output, `1` = detailed verbose output (optional, default: 0)
-- **symbol_file**: Path to symbol mapping file (optional, default: data/symbol_nyse.txt for visualizers)
+- **symbol_file**: Path to symbol mapping file (optional, default: data/symbol_nyse_parsed.csv)
 - **-t ticker**: Filter messages for specific ticker symbol (e.g., `-t AAPL`)
 
 ### Examples
@@ -132,12 +133,12 @@ g++ -std=c++11 reader.cpp -lpcap -o reader
 
 #### Filter for specific ticker
 ```bash
-./reader data/ny4-xnys-pillar-a-20230822T133000.pcap 0 data/symbol_nyse.txt -t AAPL
+./reader data/ny4-xnys-pillar-a-20230822T133000.pcap 0 data/symbol_nyse_parsed.csv -t AAPL
 ```
 
 #### Verbose output for specific ticker
 ```bash
-./reader data/ny4-xnys-pillar-a-20230822T133000.pcap 1 data/symbol_nyse.txt -t AAPL
+./reader data/ny4-xnys-pillar-a-20230822T133000.pcap 1 data/symbol_nyse_parsed.csv -t AAPL
 ```
 
 ### Output Format
@@ -216,32 +217,44 @@ The project includes VS Code launch and tasks configurations for debugging:
 cmake -DCMAKE_BUILD_TYPE=Debug ..
 make
 
-# Run with gdb
+# Run with gdb/lldb
 gdb ./reader
-(gdb) run data/ny4-xnys-pillar-a-20230822T133000.pcap 0 data/symbol_nyse.txt -t AAPL
+(gdb) run data/ny4-xnys-pillar-a-20230822T133000.pcap 0 data/symbol_nyse_parsed.csv -t AAPL
 ```
 
 ## Project Structure
 
 ```
 NYSE-XDP/
-├── CMakeLists.txt          # CMake build configuration
-├── reader.cpp              # Command-line parser implementation
-├── order_book.hpp          # Order book data structure
-├── visualization.cpp       # ImGui visualization components
-├── visualizer_main.cpp     # PCAP visualizer with playback controls
-├── visualizer_pcap.cpp     # Alternative PCAP visualizer implementation
-├── README.md               # This file
-├── data/                   # Data files
-│   ├── ny4-xnys-pillar-a-20230822T133000.pcap
-│   └── symbol_nyse.txt     # Symbol index mapping
-├── data_sheets/            # Protocol specifications
+├── CMakeLists.txt              # CMake build configuration
+├── README.md                   # This file
+├── src/                        # Source files
+│   ├── reader.cpp              # Command-line parser implementation
+│   ├── order_book.hpp          # Order book data structure
+│   ├── market_maker.cpp/hpp    # Market maker strategy implementation
+│   ├── market_maker_sim.cpp    # Market maker simulation with parallel processing
+│   ├── visualization.cpp       # ImGui visualization components
+│   ├── visualizer_main.cpp     # PCAP visualizer with playback controls
+│   ├── visualizer_pcap.cpp     # Full-featured PCAP visualizer
+│   ├── common/                 # Common utilities
+│   │   ├── pcap_reader.hpp     # PCAP file reader
+│   │   ├── mmap_pcap_reader.hpp# Memory-mapped PCAP reader
+│   │   ├── symbol_map.cpp/hpp  # Symbol mapping utilities
+│   │   ├── thread_pool.hpp     # Thread pool for parallel processing
+│   │   └── xdp_*.hpp           # XDP protocol types and utilities
+│   └── thirdparty/             # Third-party dependencies
+│       └── imgui/              # Dear ImGui library
+├── scripts/                    # Utility scripts
+│   └── run_full_day.sh         # Full trading day simulation
+├── data/                       # Data files (not in git)
+│   ├── *.pcap                  # PCAP capture files
+│   └── symbol_nyse_parsed.csv  # Symbol index mapping (CSV format)
+├── data_sheets/                # Protocol specifications
 │   ├── XDP_Integrated_Feed_Client_Specification_v2.3a.pdf
 │   └── XDP_Common_Client_Specification_v2.3c.pdf
-├── documentation/          # Architecture and design documentation
-│   └── ARCHITECTURE.md     # System architecture documentation
-└── thirdparty/             # Third-party dependencies
-    └── imgui/              # Dear ImGui library
+├── documentation/              # Architecture and design documentation
+│   └── ARCHITECTURE.md         # System architecture documentation
+└── build/                      # Build output (not in git)
 ```
 
 ## Visualization
@@ -294,14 +307,22 @@ make
 
 **Command-line reader:**
 ```bash
-./build/reader data/ny4-xnys-pillar-a-20230822T133000.pcap 0 data/symbol_nyse.txt -t AAPL
+./build/reader data/ny4-xnys-pillar-a-20230822T133000.pcap 0 data/symbol_nyse_parsed.csv -t AAPL
 ```
 
 **PCAP visualizer with playback:**
 ```bash
 ./build/visualizer_pcap data/ny4-xnys-pillar-a-20230822T133000.pcap -t AAPL
 # Or specify custom symbol file:
-./build/visualizer_pcap data/ny4-xnys-pillar-a-20230822T133000.pcap -t AAPL -s data/symbol_nyse.txt
+./build/visualizer_pcap data/ny4-xnys-pillar-a-20230822T133000.pcap -t AAPL -s data/symbol_nyse_parsed.csv
+```
+
+**Market maker simulation:**
+```bash
+# Single ticker
+./build/market_maker_sim data/ny4-xnys-pillar-a-20230822T133000.pcap data/symbol_nyse_parsed.csv -t AAPL
+# All symbols (uses parallel processing)
+./build/market_maker_sim data/ny4-xnys-pillar-a-20230822T133000.pcap data/symbol_nyse_parsed.csv
 ```
 
 **Standalone visualizer (sample data):**
@@ -317,6 +338,39 @@ make
 - **Symbol Filtering**: Filter messages by ticker symbol via command-line
 - **Thread-Safe Updates**: Multi-threaded packet processing with safe order book updates
 - **Customizable Display**: Adjustable number of levels, colors, and display options
+
+## Market Maker Simulation
+
+The `market_maker_sim` executable provides a full-featured HFT market making simulation:
+
+### Features
+- **Parallel Processing**: Multi-threaded and multi-process modes for maximum throughput
+- **Execution Model**: Realistic latency (20μs ± 5μs) and queue position modeling
+- **Toxicity Detection**: Order flow toxicity metrics to identify adverse selection
+- **P&L Tracking**: Real-time profit/loss calculation with maker rebates and taker fees
+
+### Running Full Day Simulations
+```bash
+# Run on all uncompressed PCAP segments
+./scripts/run_full_day.sh
+
+# Trading hours only (9:30 AM - 4:00 PM ET)
+./scripts/run_full_day.sh --trading-hours-only
+
+# Single ticker
+./scripts/run_full_day.sh -t AAPL --trading-hours-only
+```
+
+## Adding New Datasets
+
+To add new PCAP datasets to the project:
+
+1. Place PCAP files in the `data/` directory
+2. Update `.vscode/launch.json` and `.vscode/tasks.json`:
+   - Add new entries to the `pcapFile` input options
+3. If using a different symbol mapping, add to `symbolFile` input options
+
+The VS Code configurations use input prompts so you can easily switch between datasets when debugging or running tasks.
 
 ## Implementation Notes
 

@@ -2,9 +2,33 @@
   "version": "2.0.0",
   "tasks": [
     {
+      "label": "configure",
+      "type": "shell",
+      "command": "cmake",
+      "args": [
+        "-B",
+        "build",
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
+      ],
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "silent",
+        "panel": "shared"
+      }
+    },
+    {
       "label": "build",
       "type": "shell",
-      "command": "cmake --build build --target visualizer_pcap",
+      "command": "cmake",
+      "args": [
+        "--build",
+        "build",
+        "--target",
+        "visualizer_pcap",
+        "-j"
+      ],
       "group": {
         "kind": "build",
         "isDefault": true
@@ -20,7 +44,12 @@
     {
       "label": "build all",
       "type": "shell",
-      "command": "cmake --build build",
+      "command": "cmake",
+      "args": [
+        "--build",
+        "build",
+        "-j"
+      ],
       "group": "build",
       "problemMatcher": [
         "$gcc"
@@ -31,11 +60,56 @@
       }
     },
     {
+      "label": "build market_maker_sim",
+      "type": "shell",
+      "command": "cmake",
+      "args": [
+        "--build",
+        "build",
+        "--target",
+        "market_maker_sim",
+        "-j"
+      ],
+      "group": "build",
+      "problemMatcher": [
+        "$gcc"
+      ],
+      "presentation": {
+        "reveal": "silent",
+        "panel": "shared"
+      }
+    },
+    {
       "label": "clean",
       "type": "shell",
-      "command": "cmake --build build --target clean",
+      "command": "cmake",
+      "args": [
+        "--build",
+        "build",
+        "--target",
+        "clean"
+      ],
       "group": "build",
       "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "rebuild",
+      "type": "shell",
+      "command": "cmake",
+      "args": [
+        "--build",
+        "build",
+        "--clean-first",
+        "-j"
+      ],
+      "group": "build",
+      "problemMatcher": [
+        "$gcc"
+      ],
       "presentation": {
         "reveal": "always",
         "panel": "shared"
@@ -46,11 +120,11 @@
       "type": "shell",
       "command": "${workspaceFolder}/build/visualizer_pcap",
       "args": [
-        "data/ny4-xnys-pillar-a-20230822T133000.pcap",
+        "${input:pcapFile}",
         "-t",
         "AAPL",
         "-s",
-        "data/symbol_nyse_parsed.csv"
+        "${input:symbolFile}"
       ],
       "group": "test",
       "dependsOn": "build",
@@ -65,9 +139,9 @@
       "type": "shell",
       "command": "${workspaceFolder}/build/visualizer_pcap",
       "args": [
-        "data/ny4-xnys-pillar-a-20230822T133000.pcap",
+        "${input:pcapFile}",
         "-s",
-        "data/symbol_nyse_parsed.csv"
+        "${input:symbolFile}"
       ],
       "group": "test",
       "dependsOn": "build",
@@ -78,16 +152,22 @@
       }
     },
     {
-      "label": "build market_maker_sim",
+      "label": "run visualizer (custom ticker)",
       "type": "shell",
-      "command": "cmake --build build --target market_maker_sim",
-      "group": "build",
-      "problemMatcher": [
-        "$gcc"
+      "command": "${workspaceFolder}/build/visualizer_pcap",
+      "args": [
+        "${input:pcapFile}",
+        "-t",
+        "${input:ticker}",
+        "-s",
+        "${input:symbolFile}"
       ],
+      "group": "test",
+      "dependsOn": "build",
+      "problemMatcher": [],
       "presentation": {
-        "reveal": "silent",
-        "panel": "shared"
+        "reveal": "always",
+        "panel": "dedicated"
       }
     },
     {
@@ -95,10 +175,12 @@
       "type": "shell",
       "command": "${workspaceFolder}/build/market_maker_sim",
       "args": [
-        "data/ny4-xnys-pillar-a-20230822T133000.pcap",
-        "data/symbol_nyse_parsed.csv",
+        "${input:pcapFile}",
+        "${input:symbolFile}",
         "-t",
-        "AAPL"
+        "AAPL",
+        "--threads",
+        "${input:threads}"
       ],
       "group": "test",
       "dependsOn": "build market_maker_sim",
@@ -113,8 +195,10 @@
       "type": "shell",
       "command": "${workspaceFolder}/build/market_maker_sim",
       "args": [
-        "data/ny4-xnys-pillar-a-20230822T133000.pcap",
-        "data/symbol_nyse_parsed.csv"
+        "${input:pcapFile}",
+        "${input:symbolFile}",
+        "--threads",
+        "${input:threads}"
       ],
       "group": "test",
       "dependsOn": "build market_maker_sim",
@@ -125,7 +209,77 @@
       }
     },
     {
-      "label": "run market maker (full day)",
+      "label": "run market maker (custom ticker)",
+      "type": "shell",
+      "command": "${workspaceFolder}/build/market_maker_sim",
+      "args": [
+        "${input:pcapFile}",
+        "${input:symbolFile}",
+        "-t",
+        "${input:ticker}",
+        "--threads",
+        "${input:threads}"
+      ],
+      "group": "test",
+      "dependsOn": "build market_maker_sim",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
+      "label": "run market maker (hybrid - full day)",
+      "type": "shell",
+      "command": "${workspaceFolder}/build/market_maker_sim",
+      "args": [
+        "${input:pcapDir}/*.pcap",
+        "${input:symbolFile}",
+        "--threads",
+        "${input:threads}"
+      ],
+      "options": {
+        "shell": {
+          "executable": "/bin/bash",
+          "args": ["-c"]
+        }
+      },
+      "group": "test",
+      "dependsOn": "build market_maker_sim",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
+      "label": "run market maker (hybrid - full day - ticker)",
+      "type": "shell",
+      "command": "${workspaceFolder}/build/market_maker_sim",
+      "args": [
+        "${input:pcapDir}/*.pcap",
+        "${input:symbolFile}",
+        "-t",
+        "${input:ticker}",
+        "--threads",
+        "${input:threads}"
+      ],
+      "options": {
+        "shell": {
+          "executable": "/bin/bash",
+          "args": ["-c"]
+        }
+      },
+      "group": "test",
+      "dependsOn": "build market_maker_sim",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
+      "label": "run market maker (shell script - full day)",
       "type": "shell",
       "command": "${workspaceFolder}/scripts/run_full_day.sh",
       "group": "test",
@@ -137,7 +291,7 @@
       }
     },
     {
-      "label": "run market maker (full day - trading hours)",
+      "label": "run market maker (shell script - trading hours)",
       "type": "shell",
       "command": "${workspaceFolder}/scripts/run_full_day.sh",
       "args": [
@@ -152,7 +306,7 @@
       }
     },
     {
-      "label": "run market maker (full day - AAPL)",
+      "label": "run market maker (shell script - AAPL)",
       "type": "shell",
       "command": "${workspaceFolder}/scripts/run_full_day.sh",
       "args": [
@@ -167,6 +321,54 @@
         "reveal": "always",
         "panel": "dedicated"
       }
+    }
+  ],
+  "inputs": [
+    {
+      "id": "ticker",
+      "type": "promptString",
+      "description": "Enter ticker symbol (e.g., AAPL, MSFT, TSLA)"
+    },
+    {
+      "id": "pcapFile",
+      "type": "pickString",
+      "description": "Select PCAP data file",
+      "options": [
+        "data/ny4-xnys-pillar-a-20230822T133000.pcap"
+      ],
+      "default": "data/ny4-xnys-pillar-a-20230822T133000.pcap"
+    },
+    {
+      "id": "pcapDir",
+      "type": "pickString",
+      "description": "Select PCAP directory for hybrid/full-day processing",
+      "options": [
+        "data/uncompressed-ny4-xnyx-pillar-a-20230822"
+      ],
+      "default": "data/uncompressed-ny4-xnyx-pillar-a-20230822"
+    },
+    {
+      "id": "symbolFile",
+      "type": "pickString",
+      "description": "Select symbol mapping file",
+      "options": [
+        "data/symbol_nyse_parsed.csv"
+      ],
+      "default": "data/symbol_nyse_parsed.csv"
+    },
+    {
+      "id": "threads",
+      "type": "pickString",
+      "description": "Number of parallel threads/processes (0 = auto-detect)",
+      "options": [
+        "0",
+        "4",
+        "8",
+        "12",
+        "14",
+        "16"
+      ],
+      "default": "0"
     }
   ]
 }
