@@ -2,19 +2,35 @@
   "n_groups": 14,
   "tests": {
     "Sharpe Improvement": {
-      "obs_diff": 3.6167666878570444,
+      "obs_diff": 3.485203586665669,
       "p_value_one_sided": 0.0,
       "reject_at_0.05": true,
-      "sharpe_baseline": -1.508637078317369,
-      "sharpe_toxicity": 2.1081296095396755
+      "sharpe_baseline": -1.453759064410055,
+      "sharpe_toxicity": 2.0314445222556143
     },
     "Adverse Selection Reduction": {
-      "testable": false,
-      "reason": "No per-group or per-fill adverse-selection time series available in results.txt"
+      "testable": true,
+      "n_groups": 14,
+      "mean_baseline_adverse_penalty": 24.259514285714285,
+      "mean_toxicity_adverse_penalty": 6.826021428571429,
+      "reduction_pct": 71.86249754146532,
+      "t_statistic": -3.4799655377979652,
+      "p_value_one_sided": 0.00025073914198348035,
+      "reject_at_0.05": true,
+      "groups_with_reduction": 14,
+      "reduction_fraction": 1.0
     },
     "Inventory Variance Reduction": {
-      "testable": false,
-      "reason": "No inventory time series per group in results.txt"
+      "testable": true,
+      "n_groups": 14,
+      "mean_baseline_inventory_variance": 63640.53842142857,
+      "mean_toxicity_inventory_variance": 9136.807842857143,
+      "reduction_pct": 85.64310097071606,
+      "t_statistic": -3.5601753224418298,
+      "p_value_one_sided": 0.00018530363850749465,
+      "reject_at_0.05": true,
+      "groups_with_reduction": 14,
+      "reduction_fraction": 1.0
     },
     "Cross-Sectional Robustness": {
       "n": 14,

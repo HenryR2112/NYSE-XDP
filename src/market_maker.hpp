@@ -2,9 +2,45 @@
 
 #include "order_book.hpp"
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
+
+// ---- Online Toxicity Learning Model ----
+
+static constexpr int N_TOXICITY_FEATURES = 8;
+
+struct ToxicityFeatureVector {
+  double features[N_TOXICITY_FEATURES] = {};
+  // [0] cancel_ratio     [1] ping_ratio       [2] odd_lot_ratio
+  // [3] precision_ratio   [4] resistance_ratio  [5] trade_flow_imbalance
+  // [6] spread_change_rate [7] price_momentum
+};
+
+struct OnlineToxicityModel {
+  double weights[N_TOXICITY_FEATURES] = {0.4, 0.2, 0.15, 0.15, 0.1, 0.0, 0.0, 0.0};
+  double bias = 0.0;
+  double base_learning_rate;
+  int n_updates = 0;
+  int warmup_fills;
+
+  // Running z-score normalization (Welford's algorithm)
+  double feat_mean[N_TOXICITY_FEATURES] = {};
+  double feat_m2[N_TOXICITY_FEATURES] = {};
+  int feat_count = 0;
+
+  explicit OnlineToxicityModel(double lr = 0.01, int warmup = 50)
+      : base_learning_rate(lr), warmup_fills(warmup) {}
+
+  double predict(const ToxicityFeatureVector& fv) const;
+  void update(const ToxicityFeatureVector& fv, bool was_adverse);
+  void update_normalization(const ToxicityFeatureVector& fv);
+  bool in_warmup() const { return n_updates < warmup_fills; }
+  double current_lr() const { return base_learning_rate / (1.0 + static_cast<double>(n_updates) / 1000.0); }
+};
+
+// ---- Market Maker Stats / Types ----
 
 struct MarketMakerStats {
   double realized_pnl = 0.0;
@@ -63,10 +99,14 @@ public:
   void set_fee_per_share(double fee);
   void set_base_spread(double spread);
   void set_toxicity_multiplier(double multiplier);
+  void set_toxicity_threshold(double threshold);
+  void set_override_toxicity(double toxicity);
+  void clear_override_toxicity();
 
   // Getters
   [[nodiscard]] MarketMakerStats get_stats() const;
   [[nodiscard]] double get_inventory() const;
+  [[nodiscard]] double get_current_toxicity() const;
 
   // Reset strategy state
   void reset();
@@ -114,6 +154,10 @@ private:
   double mu_adverse_ = 0.003;  // Very low adverse expectation (excellent hedging)
   double gamma_risk_ = 0.0005; // Very low inventory risk penalty
   double fill_probability_ = 0.35;  // 35% expected fill rate (front of queue)
+
+  // Online model override for toxicity score
+  bool use_override_toxicity_ = false;
+  double override_toxicity_ = 0.0;
 
   // Rolling window for toxicity metrics
   struct ToxicityWindow {

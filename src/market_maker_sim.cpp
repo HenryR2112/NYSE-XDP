@@ -37,10 +37,16 @@
 namespace {
 
 std::string g_filter_ticker;
+std::string g_output_dir;    // Output directory for CSV files (empty = no CSV output)
 bool g_use_parallel = true;  // Enable parallel processing by default
 bool g_use_hybrid = true;    // Enable hybrid multi-process mode by default
 size_t g_num_threads = 0;    // 0 = auto-detect (use all cores)
 size_t g_files_per_group = 0; // 0 = auto (num_files / num_threads)
+double g_toxicity_threshold = 0.0;   // 0 = use default from market_maker.hpp
+double g_toxicity_multiplier = 0.0;  // 0 = use default from market_maker.hpp
+bool g_online_learning = false;      // Enable online SGD toxicity model
+double g_learning_rate = 0.01;       // Base learning rate for SGD
+int g_warmup_fills = 50;             // Fills before SGD kicks in
 
 // =============================================================================
 // HFT Market Maker Execution Model
@@ -92,6 +98,76 @@ struct ExecutionModelConfig {
 
 ExecutionModelConfig g_exec;
 
+// ---- Feature Trackers (circular buffers for online learning) ----
+
+struct TradeFlowTracker {
+  static constexpr int WINDOW = 100;
+  struct Trade { bool is_buy; uint32_t volume; };
+  std::array<Trade, WINDOW> buffer = {};
+  int head = 0;
+  int count = 0;
+
+  void record_trade(bool is_buy, uint32_t volume) {
+    buffer[head] = {is_buy, volume};
+    head = (head + 1) % WINDOW;
+    if (count < WINDOW) count++;
+  }
+
+  double get_imbalance() const {
+    if (count == 0) return 0.0;
+    double buy_vol = 0.0, sell_vol = 0.0;
+    for (int i = 0; i < count; i++) {
+      const auto& t = buffer[i];
+      if (t.is_buy) buy_vol += t.volume;
+      else sell_vol += t.volume;
+    }
+    double total = buy_vol + sell_vol;
+    return (total > 0) ? (buy_vol - sell_vol) / total : 0.0;
+  }
+};
+
+struct SpreadTracker {
+  static constexpr int WINDOW = 50;
+  std::array<double, WINDOW> buffer = {};
+  int head = 0;
+  int count = 0;
+
+  void record_spread(double spread) {
+    buffer[head] = spread;
+    head = (head + 1) % WINDOW;
+    if (count < WINDOW) count++;
+  }
+
+  double get_spread_change_rate() const {
+    if (count < 2) return 0.0;
+    double current = buffer[(head - 1 + WINDOW) % WINDOW];
+    int oldest_idx = (count < WINDOW) ? 0 : head;
+    double oldest = buffer[oldest_idx];
+    return (oldest > 1e-10) ? (current - oldest) / oldest : 0.0;
+  }
+};
+
+struct MomentumTracker {
+  static constexpr int WINDOW = 50;
+  std::array<double, WINDOW> buffer = {};
+  int head = 0;
+  int count = 0;
+
+  void record_mid(double mid) {
+    buffer[head] = mid;
+    head = (head + 1) % WINDOW;
+    if (count < WINDOW) count++;
+  }
+
+  double get_momentum() const {
+    if (count < 2) return 0.0;
+    double current = buffer[(head - 1 + WINDOW) % WINDOW];
+    int oldest_idx = (count < WINDOW) ? 0 : head;
+    double oldest = buffer[oldest_idx];
+    return (oldest > 1e-10) ? (current - oldest) / oldest : 0.0;
+  }
+};
+
 struct VirtualOrder {
   double price = 0.0;
   uint32_t size = 0;
@@ -114,8 +190,10 @@ struct FillRecord {
   uint32_t fill_qty;
   bool is_buy;
   double mid_price_at_fill;
+  double toxicity_at_fill = 0.0;  // Toxicity score at time of fill
   bool adverse_measured = false;
   double adverse_pnl = 0.0;
+  ToxicityFeatureVector features;  // Per-fill feature vector for online learning
 };
 
 // Per-symbol risk state
@@ -126,6 +204,24 @@ struct SymbolRiskState {
   int64_t total_fills = 0;
   double total_adverse_pnl = 0.0;
   int64_t adverse_fills = 0;
+
+  // Inventory variance tracking (Welford's online algorithm)
+  double inv_mean = 0.0;
+  double inv_m2 = 0.0;   // Sum of squared differences from mean
+  int64_t inv_count = 0; // Number of inventory samples
+
+  void update_inventory_variance(double inventory) {
+    inv_count++;
+    double delta = inventory - inv_mean;
+    inv_mean += delta / static_cast<double>(inv_count);
+    double delta2 = inventory - inv_mean;
+    inv_m2 += delta * delta2;
+  }
+
+  double get_inventory_variance() const {
+    if (inv_count < 2) return 0.0;
+    return inv_m2 / static_cast<double>(inv_count - 1);
+  }
 };
 
 struct PerSymbolSim {
@@ -163,6 +259,16 @@ struct PerSymbolSim {
   std::vector<FillRecord> baseline_pending_fills;
   std::vector<FillRecord> toxicity_pending_fills;
 
+  // Completed fills with measured adverse_pnl (for CSV output)
+  std::vector<FillRecord> baseline_completed_fills;
+  std::vector<FillRecord> toxicity_completed_fills;
+
+  // Online learning feature trackers and model
+  OnlineToxicityModel online_model;
+  TradeFlowTracker trade_flow;
+  SpreadTracker spread_tracker;
+  MomentumTracker momentum_tracker;
+
   PerSymbolSim()
       : order_book_baseline(), order_book_toxicity(),
         mm_baseline(order_book_baseline, false),
@@ -187,6 +293,19 @@ struct PerSymbolSim {
     double net_fee = -(g_exec.maker_rebate_per_share - g_exec.clearing_fee_per_share);
     mm_baseline.set_fee_per_share(net_fee);
     mm_toxicity.set_fee_per_share(net_fee);
+
+    // Apply CLI-overridden toxicity parameters
+    if (g_toxicity_threshold > 0.0) {
+      mm_toxicity.set_toxicity_threshold(g_toxicity_threshold);
+    }
+    if (g_toxicity_multiplier > 0.0) {
+      mm_toxicity.set_toxicity_multiplier(g_toxicity_multiplier);
+    }
+
+    // Initialize online learning model with CLI params
+    if (g_online_learning) {
+      online_model = OnlineToxicityModel(g_learning_rate, g_warmup_fills);
+    }
   }
 
   uint64_t sample_latency_ns() {
@@ -246,8 +365,55 @@ struct PerSymbolSim {
     return true;
   }
 
+  // Build current feature vector from order book and trackers
+  ToxicityFeatureVector build_feature_vector() {
+    ToxicityFeatureVector fv;
+
+    // Average the 5 order-book features across top 3 bid + 3 ask levels
+    constexpr int levels = 3;
+    int count = 0;
+    auto bids = order_book_toxicity.get_bids();
+    auto asks = order_book_toxicity.get_asks();
+
+    int bid_levels = 0;
+    for (const auto& [price, qty] : bids) {
+      if (bid_levels >= levels) break;
+      auto fr = order_book_toxicity.get_feature_ratios(price, 'B');
+      fv.features[0] += fr.cancel_ratio;
+      fv.features[1] += fr.ping_ratio;
+      fv.features[2] += fr.odd_lot_ratio;
+      fv.features[3] += fr.precision_ratio;
+      fv.features[4] += fr.resistance_ratio;
+      count++;
+      bid_levels++;
+    }
+    int ask_levels = 0;
+    for (const auto& [price, qty] : asks) {
+      if (ask_levels >= levels) break;
+      auto fr = order_book_toxicity.get_feature_ratios(price, 'S');
+      fv.features[0] += fr.cancel_ratio;
+      fv.features[1] += fr.ping_ratio;
+      fv.features[2] += fr.odd_lot_ratio;
+      fv.features[3] += fr.precision_ratio;
+      fv.features[4] += fr.resistance_ratio;
+      count++;
+      ask_levels++;
+    }
+    if (count > 0) {
+      for (int i = 0; i < 5; i++) fv.features[i] /= count;
+    }
+
+    // New temporal features
+    fv.features[5] = trade_flow.get_imbalance();
+    fv.features[6] = spread_tracker.get_spread_change_rate();
+    fv.features[7] = momentum_tracker.get_momentum();
+
+    return fv;
+  }
+
   // Measure adverse selection on pending fills
   void measure_adverse_selection(std::vector<FillRecord>& fills,
+                                  std::vector<FillRecord>* completed,
                                   SymbolRiskState& risk,
                                   uint64_t now_ns) {
     auto stats = order_book_toxicity.get_stats();
@@ -280,6 +446,12 @@ struct PerSymbolSim {
         risk.total_adverse_pnl += fill.adverse_pnl;
         risk.adverse_fills++;
       }
+
+      // Train online model: label = was there meaningful adverse selection?
+      if (g_online_learning) {
+        bool was_adverse = (adverse_move > 0.005);  // > half a cent threshold
+        online_model.update(fill.features, was_adverse);
+      }
     }
 
     // Clean up old measured fills - also force cleanup if vector is too large
@@ -287,6 +459,15 @@ struct PerSymbolSim {
       // Emergency cleanup - mark old fills as measured
       for (size_t i = 0; i < fills.size() - 5000; i++) {
         fills[i].adverse_measured = true;
+      }
+    }
+
+    // Move measured fills to completed vector (for CSV output) before erasing
+    if (completed) {
+      for (auto& f : fills) {
+        if (f.adverse_measured) {
+          completed->push_back(std::move(f));
+        }
       }
     }
 
@@ -335,8 +516,18 @@ struct PerSymbolSim {
     last_quote_update_ns = now_ns;
 
     // Measure adverse selection on any pending fills
-    measure_adverse_selection(baseline_pending_fills, baseline_risk, now_ns);
-    measure_adverse_selection(toxicity_pending_fills, toxicity_risk, now_ns);
+    // Pass completed vectors for CSV output when output directory is set
+    auto* bc = g_output_dir.empty() ? nullptr : &baseline_completed_fills;
+    auto* tc = g_output_dir.empty() ? nullptr : &toxicity_completed_fills;
+    measure_adverse_selection(baseline_pending_fills, bc, baseline_risk, now_ns);
+    measure_adverse_selection(toxicity_pending_fills, tc, toxicity_risk, now_ns);
+
+    // Update spread and momentum trackers
+    {
+      auto book_stats = order_book_toxicity.get_stats();
+      if (book_stats.spread > 0) spread_tracker.record_spread(book_stats.spread);
+      if (book_stats.mid_price > 0) momentum_tracker.record_mid(book_stats.mid_price);
+    }
 
     // Check eligibility and risk limits
     eligible_to_trade = check_eligibility();
@@ -344,6 +535,13 @@ struct PerSymbolSim {
 
     if (!check_risk_limits(baseline_risk) || !check_risk_limits(toxicity_risk)) {
       return;
+    }
+
+    // Feed online model prediction to toxicity strategy
+    if (g_online_learning && !online_model.in_warmup()) {
+      auto fv = build_feature_vector();
+      double predicted_toxicity = online_model.predict(fv);
+      mm_toxicity.set_override_toxicity(predicted_toxicity);
     }
 
     mm_baseline.update_market_data();
@@ -490,6 +688,9 @@ struct PerSymbolSim {
     mm.on_order_filled(is_bid_side, vo.price, fill_qty);
     risk.total_fills++;
 
+    // Track inventory variance for hypothesis testing H3
+    risk.update_inventory_variance(mm.get_inventory());
+
     // Record fill for adverse selection measurement
     auto stats = order_book_toxicity.get_stats();
     FillRecord record;
@@ -498,6 +699,15 @@ struct PerSymbolSim {
     record.fill_qty = fill_qty;
     record.is_buy = is_bid_side;
     record.mid_price_at_fill = stats.mid_price;
+
+    // Build feature vector and store with fill
+    record.features = build_feature_vector();
+
+    if (g_online_learning && !online_model.in_warmup()) {
+      record.toxicity_at_fill = online_model.predict(record.features);
+    } else {
+      record.toxicity_at_fill = mm.get_current_toxicity();
+    }
     pending_fills.push_back(record);
   }
 
@@ -528,6 +738,10 @@ struct PerSymbolSim {
                   uint64_t now_ns) {
     auto it = order_info.find(order_id);
     if (it != order_info.end()) {
+      // Feed trade flow tracker with execution side
+      bool is_buy = (it->second.side == 'B');
+      trade_flow.record_trade(is_buy, exec_qty);
+
       maybe_fill_on_execution(it->second.side, exec_price, exec_qty, now_ns);
 
       // Update volume tracking (partial fills reduce remaining volume)
@@ -874,6 +1088,13 @@ void print_usage(const char *program) {
             << "  --max-loss L        Max daily loss per symbol (default: 500)\n"
             << "  --quote-interval-us Q  Quote update interval (default: 50)\n"
             << "  --fill-mode M       Fill mode: cross or match (default: cross)\n"
+            << "  --toxicity-threshold T  Toxicity threshold for quote suppression (default: 0.75)\n"
+            << "  --toxicity-multiplier K  Toxicity spread multiplier (default: 1.0)\n"
+            << "  --output-dir DIR    Output directory for per-fill/per-symbol CSV files\n"
+            << "\nOnline Learning Options:\n"
+            << "  --online-learning   Enable online SGD for toxicity weights\n"
+            << "  --learning-rate R   SGD base learning rate (default: 0.01)\n"
+            << "  --warmup-fills N    Fills before SGD activates (default: 50)\n"
             << "\nParallel Processing Options:\n"
             << "  --threads N         Number of processes (default: auto-detect all cores)\n"
             << "  --files-per-group N Files per process group (default: auto)\n"
@@ -893,10 +1114,14 @@ struct ProcessResults {
   double baseline_pnl;
   double toxicity_pnl;
   double adverse_pnl;
+  double baseline_adverse_pnl;  // For hypothesis testing H2
+  double baseline_inv_variance; // For hypothesis testing H3
+  double toxicity_inv_variance; // For hypothesis testing H3
   int64_t baseline_fills;
   int64_t toxicity_fills;
   int64_t quotes_suppressed;
   int64_t adverse_fills;
+  int64_t baseline_adverse_fills;  // For hypothesis testing H2
   uint64_t packets_processed;
   uint64_t messages_processed;
   uint64_t symbols_active;
@@ -1033,8 +1258,10 @@ void process_file_group(const std::vector<std::string>& files,
   }
 
   // Aggregate results from this process
-  double baseline_pnl = 0.0, toxicity_pnl = 0.0, adverse_pnl = 0.0;
-  int64_t baseline_fills = 0, toxicity_fills = 0, quotes_suppressed = 0, adverse_fills = 0;
+  double baseline_pnl = 0.0, toxicity_pnl = 0.0, adverse_pnl = 0.0, baseline_adverse_pnl = 0.0;
+  double baseline_inv_variance_sum = 0.0, toxicity_inv_variance_sum = 0.0;
+  int64_t baseline_fills = 0, toxicity_fills = 0, quotes_suppressed = 0, adverse_fills = 0, baseline_adverse_fills = 0;
+  int64_t symbols_with_inv_data = 0;
 
   for (uint32_t idx = 0; idx < MAX_SYMBOLS; ++idx) {
     if (!g_sims_initialized[idx].load(std::memory_order_relaxed)) continue;
@@ -1047,32 +1274,163 @@ void process_file_group(const std::vector<std::string>& files,
     baseline_pnl += bs.realized_pnl + bs.unrealized_pnl + sim->baseline_risk.total_adverse_pnl;
     toxicity_pnl += ts.realized_pnl + ts.unrealized_pnl + sim->toxicity_risk.total_adverse_pnl;
     adverse_pnl += sim->toxicity_risk.total_adverse_pnl;
+    baseline_adverse_pnl += sim->baseline_risk.total_adverse_pnl;
     baseline_fills += sim->baseline_risk.total_fills;
     toxicity_fills += sim->toxicity_risk.total_fills;
     quotes_suppressed += ts.quotes_suppressed;
     adverse_fills += sim->toxicity_risk.adverse_fills;
+    baseline_adverse_fills += sim->baseline_risk.adverse_fills;
+
+    // Aggregate inventory variance (weighted sum by sample count)
+    if (sim->baseline_risk.inv_count > 1 && sim->toxicity_risk.inv_count > 1) {
+      baseline_inv_variance_sum += sim->baseline_risk.get_inventory_variance();
+      toxicity_inv_variance_sum += sim->toxicity_risk.get_inventory_variance();
+      symbols_with_inv_data++;
+    }
+  }
+
+  // Compute average inventory variance across symbols
+  double baseline_inv_var_avg = (symbols_with_inv_data > 0) ? baseline_inv_variance_sum / symbols_with_inv_data : 0.0;
+  double toxicity_inv_var_avg = (symbols_with_inv_data > 0) ? toxicity_inv_variance_sum / symbols_with_inv_data : 0.0;
+
+  // Aggregate online model learned weights across symbols (weighted by n_updates)
+  if (g_online_learning) {
+    double avg_weights[N_TOXICITY_FEATURES] = {};
+    double avg_bias = 0.0;
+    int total_updates = 0;
+    int models_trained = 0;
+    for (uint32_t idx = 0; idx < MAX_SYMBOLS; ++idx) {
+      if (!g_sims_initialized[idx].load(std::memory_order_relaxed)) continue;
+      PerSymbolSim* sim = g_sims_array[idx];
+      if (!sim || !sim->eligible_to_trade) continue;
+      const auto& model = sim->online_model;
+      if (model.n_updates > model.warmup_fills) {
+        int effective = model.n_updates - model.warmup_fills;
+        for (int i = 0; i < N_TOXICITY_FEATURES; i++) {
+          avg_weights[i] += model.weights[i] * effective;
+        }
+        avg_bias += model.bias * effective;
+        total_updates += effective;
+        models_trained++;
+      }
+    }
+    if (total_updates > 0) {
+      for (int i = 0; i < N_TOXICITY_FEATURES; i++) {
+        avg_weights[i] /= total_updates;
+      }
+      avg_bias /= total_updates;
+    }
+    std::cerr << "[Group " << (group_idx+1) << "] Online model: "
+              << models_trained << " symbols trained, "
+              << total_updates << " total updates, "
+              << "weights=[";
+    for (int i = 0; i < N_TOXICITY_FEATURES; i++) {
+      if (i > 0) std::cerr << ", ";
+      std::cerr << std::fixed << std::setprecision(4) << avg_weights[i];
+    }
+    std::cerr << "], bias=" << std::fixed << std::setprecision(4) << avg_bias << "\n" << std::flush;
   }
 
   // Debug: confirm aggregation complete
   std::cerr << "[Group " << (group_idx+1) << "] Aggregation done: "
             << g_total_packets.load() << " pkts, "
             << g_active_symbols.load() << " syms, "
-            << "baseline $" << baseline_pnl << ", toxicity $" << toxicity_pnl << "\n" << std::flush;
+            << "baseline $" << baseline_pnl << ", toxicity $" << toxicity_pnl
+            << ", baseline_adv $" << baseline_adverse_pnl
+            << ", baseline_inv_var " << baseline_inv_var_avg << ", tox_inv_var " << toxicity_inv_var_avg
+            << "\n" << std::flush;
 
   // Write results to shared memory
   results->baseline_pnl = baseline_pnl;
   results->toxicity_pnl = toxicity_pnl;
   results->adverse_pnl = adverse_pnl;
+  results->baseline_adverse_pnl = baseline_adverse_pnl;
+  results->baseline_inv_variance = baseline_inv_var_avg;
+  results->toxicity_inv_variance = toxicity_inv_var_avg;
   results->baseline_fills = baseline_fills;
   results->toxicity_fills = toxicity_fills;
   results->quotes_suppressed = quotes_suppressed;
   results->adverse_fills = adverse_fills;
+  results->baseline_adverse_fills = baseline_adverse_fills;
   results->packets_processed = g_total_packets.load();
   results->messages_processed = g_total_messages.load();
   results->symbols_active = g_active_symbols.load();
   results->completed = true;
 
   std::cerr << "[Group " << (group_idx+1) << "] Results written to shared memory\n" << std::flush;
+
+  // Write per-fill and per-symbol CSV output if output directory specified
+  if (!g_output_dir.empty()) {
+    // Per-fill CSV: toxicity score at fill time + realized adverse movement
+    {
+      std::string fill_path = g_output_dir + "/fills_group_" + std::to_string(group_idx + 1) + ".csv";
+      std::ofstream fout(fill_path);
+      if (fout.is_open()) {
+        fout << "group,symbol,ticker,strategy,fill_time_ns,fill_price,fill_qty,is_buy,"
+             << "mid_price_at_fill,toxicity_at_fill,adverse_measured,adverse_pnl,"
+             << "cancel_ratio,ping_ratio,odd_lot_ratio,precision_ratio,resistance_ratio,"
+             << "trade_flow_imbalance,spread_change_rate,price_momentum\n";
+        for (uint32_t idx = 0; idx < MAX_SYMBOLS; ++idx) {
+          if (!g_sims_initialized[idx].load(std::memory_order_relaxed)) continue;
+          PerSymbolSim* sim = g_sims_array[idx];
+          if (!sim || !sim->eligible_to_trade) continue;
+          std::string ticker = xdp::get_symbol(idx);
+          // Lambda to write a fill row
+          auto write_fill = [&](const FillRecord& fill, const char* strategy) {
+            fout << (group_idx+1) << ',' << idx << ',' << ticker << ',' << strategy << ','
+                 << fill.fill_time_ns << ',' << std::fixed << std::setprecision(4)
+                 << fill.fill_price << ',' << fill.fill_qty << ','
+                 << (fill.is_buy ? 1 : 0) << ',' << fill.mid_price_at_fill << ','
+                 << fill.toxicity_at_fill << ',' << (fill.adverse_measured ? 1 : 0)
+                 << ',' << fill.adverse_pnl;
+            for (int fi = 0; fi < N_TOXICITY_FEATURES; fi++) {
+              fout << ',' << fill.features.features[fi];
+            }
+            fout << '\n';
+          };
+          // Toxicity strategy: completed fills (with measured adverse_pnl) + remaining pending
+          for (const auto& fill : sim->toxicity_completed_fills) write_fill(fill, "toxicity");
+          for (const auto& fill : sim->toxicity_pending_fills)   write_fill(fill, "toxicity");
+          // Baseline strategy: completed fills + remaining pending
+          for (const auto& fill : sim->baseline_completed_fills) write_fill(fill, "baseline");
+          for (const auto& fill : sim->baseline_pending_fills)   write_fill(fill, "baseline");
+        }
+        fout.close();
+        std::cerr << "[Group " << (group_idx+1) << "] Wrote fills CSV: " << fill_path << "\n" << std::flush;
+      }
+    }
+
+    // Per-symbol CSV: summary metrics per symbol
+    {
+      std::string sym_path = g_output_dir + "/symbols_group_" + std::to_string(group_idx + 1) + ".csv";
+      std::ofstream fout(sym_path);
+      if (fout.is_open()) {
+        fout << "group,symbol_index,ticker,baseline_pnl,toxicity_pnl,improvement,"
+             << "baseline_fills,toxicity_fills,quotes_suppressed,"
+             << "baseline_adverse_pnl,toxicity_adverse_pnl,"
+             << "baseline_inv_var,toxicity_inv_var\n";
+        for (uint32_t idx = 0; idx < MAX_SYMBOLS; ++idx) {
+          if (!g_sims_initialized[idx].load(std::memory_order_relaxed)) continue;
+          PerSymbolSim* sim = g_sims_array[idx];
+          if (!sim || !sim->eligible_to_trade) continue;
+          const auto& bs = sim->mm_baseline.get_stats();
+          const auto& ts = sim->mm_toxicity.get_stats();
+          double b_pnl = bs.realized_pnl + bs.unrealized_pnl + sim->baseline_risk.total_adverse_pnl;
+          double t_pnl = ts.realized_pnl + ts.unrealized_pnl + sim->toxicity_risk.total_adverse_pnl;
+          fout << (group_idx+1) << ',' << idx << ',' << xdp::get_symbol(idx) << ','
+               << std::fixed << std::setprecision(4)
+               << b_pnl << ',' << t_pnl << ',' << (t_pnl - b_pnl) << ','
+               << sim->baseline_risk.total_fills << ',' << sim->toxicity_risk.total_fills << ','
+               << ts.quotes_suppressed << ','
+               << sim->baseline_risk.total_adverse_pnl << ',' << sim->toxicity_risk.total_adverse_pnl << ','
+               << sim->baseline_risk.get_inventory_variance() << ','
+               << sim->toxicity_risk.get_inventory_variance() << '\n';
+        }
+        fout.close();
+        std::cerr << "[Group " << (group_idx+1) << "] Wrote symbols CSV: " << sym_path << "\n" << std::flush;
+      }
+    }
+  }
 }
 
 } // namespace
@@ -1124,6 +1482,18 @@ int main(int argc, char *argv[]) {
       g_num_threads = std::stoull(argv[++i]);
     } else if (arg == "--files-per-group" && i + 1 < argc) {
       g_files_per_group = std::stoull(argv[++i]);
+    } else if (arg == "--toxicity-threshold" && i + 1 < argc) {
+      g_toxicity_threshold = std::stod(argv[++i]);
+    } else if (arg == "--toxicity-multiplier" && i + 1 < argc) {
+      g_toxicity_multiplier = std::stod(argv[++i]);
+    } else if (arg == "--output-dir" && i + 1 < argc) {
+      g_output_dir = argv[++i];
+    } else if (arg == "--online-learning") {
+      g_online_learning = true;
+    } else if (arg == "--learning-rate" && i + 1 < argc) {
+      g_learning_rate = std::stod(argv[++i]);
+    } else if (arg == "--warmup-fills" && i + 1 < argc) {
+      g_warmup_fills = std::stoi(argv[++i]);
     } else if (arg == "--sequential") {
       g_use_parallel = false;
       g_use_hybrid = false;
@@ -1269,8 +1639,10 @@ int main(int argc, char *argv[]) {
 
     // Aggregate results from all processes
     double total_baseline_pnl = 0.0, total_toxicity_pnl = 0.0, total_adverse_pnl = 0.0;
+    double total_baseline_adverse_pnl = 0.0;
+    double total_baseline_inv_var = 0.0, total_toxicity_inv_var = 0.0;
     int64_t total_baseline_fills = 0, total_toxicity_fills = 0;
-    int64_t total_quotes_suppressed = 0, total_adverse_fills = 0;
+    int64_t total_quotes_suppressed = 0, total_adverse_fills = 0, total_baseline_adverse_fills = 0;
     uint64_t total_packets = 0, total_messages = 0, total_symbols = 0;
     size_t groups_with_results = 0;
 
@@ -1280,10 +1652,14 @@ int main(int argc, char *argv[]) {
         total_baseline_pnl += shared_results[i].baseline_pnl;
         total_toxicity_pnl += shared_results[i].toxicity_pnl;
         total_adverse_pnl += shared_results[i].adverse_pnl;
+        total_baseline_adverse_pnl += shared_results[i].baseline_adverse_pnl;
+        total_baseline_inv_var += shared_results[i].baseline_inv_variance;
+        total_toxicity_inv_var += shared_results[i].toxicity_inv_variance;
         total_baseline_fills += shared_results[i].baseline_fills;
         total_toxicity_fills += shared_results[i].toxicity_fills;
         total_quotes_suppressed += shared_results[i].quotes_suppressed;
         total_adverse_fills += shared_results[i].adverse_fills;
+        total_baseline_adverse_fills += shared_results[i].baseline_adverse_fills;
         total_packets += shared_results[i].packets_processed;
         total_messages += shared_results[i].messages_processed;
         total_symbols += shared_results[i].symbols_active;
@@ -1325,8 +1701,38 @@ int main(int argc, char *argv[]) {
     std::cout << "Toxicity fills: " << total_toxicity_fills << '\n';
     std::cout << "Quotes suppressed: " << total_quotes_suppressed << '\n';
     std::cout << "Adverse fills: " << total_adverse_fills << '\n';
+    std::cout << "Baseline adverse fills: " << total_baseline_adverse_fills << '\n';
     std::cout << "Total adverse penalty: $" << std::fixed << std::setprecision(2)
               << total_adverse_pnl << '\n';
+    std::cout << "Baseline adverse penalty: $" << std::fixed << std::setprecision(2)
+              << total_baseline_adverse_pnl << '\n';
+
+    // Output hypothesis testing metrics (per-group)
+    double avg_baseline_inv_var = (groups_with_results > 0) ? total_baseline_inv_var / groups_with_results : 0.0;
+    double avg_toxicity_inv_var = (groups_with_results > 0) ? total_toxicity_inv_var / groups_with_results : 0.0;
+    std::cout << "\n=== HYPOTHESIS TESTING METRICS ===\n";
+    std::cout << "Average Baseline Inventory Variance: " << std::fixed << std::setprecision(2)
+              << avg_baseline_inv_var << '\n';
+    std::cout << "Average Toxicity Inventory Variance: " << std::fixed << std::setprecision(2)
+              << avg_toxicity_inv_var << '\n';
+    std::cout << "Inventory Variance Reduction: " << std::fixed << std::setprecision(2)
+              << ((avg_baseline_inv_var > 0) ? (1.0 - avg_toxicity_inv_var / avg_baseline_inv_var) * 100.0 : 0.0)
+              << "%\n";
+
+    // Output per-group data for hypothesis testing script
+    std::cout << "\n=== PER-GROUP RESULTS (FOR HYPOTHESIS TESTING) ===\n";
+    for (size_t i = 0; i < actual_groups; ++i) {
+      if (shared_results[i].completed) {
+        std::cout << "Group " << (i+1) << ": "
+                  << "baseline_pnl=" << std::fixed << std::setprecision(4) << shared_results[i].baseline_pnl
+                  << ", toxicity_pnl=" << shared_results[i].toxicity_pnl
+                  << ", baseline_adv=" << shared_results[i].baseline_adverse_pnl
+                  << ", toxicity_adv=" << shared_results[i].adverse_pnl
+                  << ", baseline_inv_var=" << shared_results[i].baseline_inv_variance
+                  << ", toxicity_inv_var=" << shared_results[i].toxicity_inv_variance
+                  << '\n';
+      }
+    }
 
     // Cleanup shared memory
     munmap(shared_results, shm_size);

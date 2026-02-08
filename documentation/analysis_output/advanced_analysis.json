@@ -1,0 +1,232 @@
+{
+  "toxicity_decile_analysis": {
+    "testable": true,
+    "n_fills_analyzed": 3171,
+    "n_baseline_fills": 17450,
+    "deciles": [
+      {
+        "decile": 1,
+        "n_fills": 317,
+        "avg_toxicity": 0.027957097791798106,
+        "min_toxicity": 0.0,
+        "max_toxicity": 0.0514,
+        "avg_adverse_pnl": 0.029110725552050472,
+        "total_adverse_pnl": 9.228099999999996
+      },
+      {
+        "decile": 2,
+        "n_fills": 317,
+        "avg_toxicity": 0.06844763406940063,
+        "min_toxicity": 0.0514,
+        "max_toxicity": 0.0822,
+        "avg_adverse_pnl": 0.04180946372239747,
+        "total_adverse_pnl": 13.253599999999999
+      },
+      {
+        "decile": 3,
+        "n_fills": 317,
+        "avg_toxicity": 0.09433375394321766,
+        "min_toxicity": 0.0831,
+        "max_toxicity": 0.1051,
+        "avg_adverse_pnl": 0.029534384858044164,
+        "total_adverse_pnl": 9.362399999999996
+      },
+      {
+        "decile": 4,
+        "n_fills": 317,
+        "avg_toxicity": 0.11414921135646687,
+        "min_toxicity": 0.1052,
+        "max_toxicity": 0.1231,
+        "avg_adverse_pnl": 0.02544858044164038,
+        "total_adverse_pnl": 8.0672
+      },
+      {
+        "decile": 5,
+        "n_fills": 317,
+        "avg_toxicity": 0.13213596214511042,
+        "min_toxicity": 0.1233,
+        "max_toxicity": 0.1411,
+        "avg_adverse_pnl": 0.045653312302839116,
+        "total_adverse_pnl": 14.472100000000001
+      },
+      {
+        "decile": 6,
+        "n_fills": 317,
+        "avg_toxicity": 0.15029526813880126,
+        "min_toxicity": 0.1411,
+        "max_toxicity": 0.1599,
+        "avg_adverse_pnl": 0.028245425867507886,
+        "total_adverse_pnl": 8.9538
+      },
+      {
+        "decile": 7,
+        "n_fills": 317,
+        "avg_toxicity": 0.16882902208201891,
+        "min_toxicity": 0.1599,
+        "max_toxicity": 0.1773,
+        "avg_adverse_pnl": 0.024681072555205047,
+        "total_adverse_pnl": 7.8239
+      },
+      {
+        "decile": 8,
+        "n_fills": 317,
+        "avg_toxicity": 0.1852794952681388,
+        "min_toxicity": 0.1773,
+        "max_toxicity": 0.193,
+        "avg_adverse_pnl": 0.027636593059936907,
+        "total_adverse_pnl": 8.760800000000001
+      },
+      {
+        "decile": 9,
+        "n_fills": 317,
+        "avg_toxicity": 0.20111324921135645,
+        "min_toxicity": 0.1931,
+        "max_toxicity": 0.2115,
+        "avg_adverse_pnl": 0.0274192429022082,
+        "total_adverse_pnl": 8.691900000000006
+      },
+      {
+        "decile": 10,
+        "n_fills": 318,
+        "avg_toxicity": 0.24572672955974842,
+        "min_toxicity": 0.2115,
+        "max_toxicity": 0.475,
+        "avg_adverse_pnl": 0.021859119496855345,
+        "total_adverse_pnl": 6.951199999999998
+      }
+    ]
+  },
+  "spearman_correlation": {
+    "testable": true,
+    "spearman_rho": 0.11799383476424341,
+    "n_fills": 3171,
+    "t_statistic": 6.689057368037159,
+    "p_value_two_sided": 2.2461144055796467e-11,
+    "significant_at_0.05": true
+  },
+  "per_feature_correlation": {
+    "testable": true,
+    "n_fills": 3171,
+    "features": [
+      {
+        "feature": "cancel_ratio",
+        "spearman_rho": 0.11638370625833568,
+        "abs_rho": 0.11638370625833568,
+        "t_statistic": 6.59651721884856,
+        "p_value": 4.2092995755638185e-11,
+        "significant": true,
+        "mean_value": 0.2380928729107537,
+        "std_value": 0.1391813325706748
+      },
+      {
+        "feature": "odd_lot_ratio",
+        "spearman_rho": 0.07569126597544479,
+        "abs_rho": 0.07569126597544479,
+        "t_statistic": 4.27321298174709,
+        "p_value": 1.926762543691396e-05,
+        "significant": true,
+        "mean_value": 0.16984660990223904,
+        "std_value": 0.18171539997523695
+      },
+      {
+        "feature": "ping_ratio",
+        "spearman_rho": 0.06909077109142112,
+        "abs_rho": 0.06909077109142112,
+        "t_statistic": 3.89870343836321,
+        "p_value": 9.670913063586362e-05,
+        "significant": true,
+        "mean_value": 0.05814519079154841,
+        "std_value": 0.10101657602917619
+      },
+      {
+        "feature": "precision_ratio",
+        "spearman_rho": -0.0506055785943526,
+        "abs_rho": 0.0506055785943526,
+        "t_statistic": -2.8524387343967215,
+        "p_value": 0.004338517462910252,
+        "significant": true,
+        "mean_value": 0.022624503311258277,
+        "std_value": 0.13406111411087335
+      },
+      {
+        "feature": "trade_flow_imbalance",
+        "spearman_rho": -0.03275779990571674,
+        "abs_rho": 0.03275779990571674,
+        "t_statistic": -1.845053592420369,
+        "p_value": 0.06502974305187492,
+        "significant": false,
+        "mean_value": 0.09498921475875119,
+        "std_value": 0.8545021807279702
+      },
+      {
+        "feature": "spread_change_rate",
+        "spearman_rho": -0.020130714996506326,
+        "abs_rho": 0.020130714996506326,
+        "t_statistic": -1.133465578146622,
+        "p_value": 0.257018788509934,
+        "significant": false,
+        "mean_value": 0.07520495111952066,
+        "std_value": 1.3758533462561964
+      },
+      {
+        "feature": "resistance_ratio",
+        "spearman_rho": -0.006166553352621251,
+        "abs_rho": 0.006166553352621251,
+        "t_statistic": -0.34714576416907994,
+        "p_value": 0.7284818139160059,
+        "significant": false,
+        "mean_value": 0.031239640491958372,
+        "std_value": 0.07843929824423258
+      },
+      {
+        "feature": "price_momentum",
+        "spearman_rho": -0.0005385756914644849,
+        "abs_rho": 0.0005385756914644849,
+        "t_statistic": -0.030318515316359314,
+        "p_value": 0.9758130302729986,
+        "significant": false,
+        "mean_value": -0.0019807000946073794,
+        "std_value": 0.04531830275680482
+      }
+    ]
+  },
+  "symbol_bootstrap": {
+    "testable": true,
+    "n_symbols": 3731,
+    "n_bootstrap": 10000,
+    "observed_mean_improvement": 4.592332457786116,
+    "observed_total_toxicity_pnl": 791.712299999991,
+    "observed_total_baseline_pnl": -16342.280399999932,
+    "fraction_symbols_improved": 0.4714553738943983,
+    "bootstrap_ci_95_improvement": [
+      3.4838239346019835,
+      5.9616128919860625
+    ],
+    "bootstrap_ci_95_toxicity_pnl": [
+      747.0167999999928,
+      837.2531999999891
+    ],
+    "bootstrap_ci_95_baseline_pnl": [
+      -21426.25410000001,
+      -12208.09219999996
+    ],
+    "p_value_improvement_gt_zero": 0.0
+  },
+  "hac_standard_errors": {
+    "testable": true,
+    "n": 82,
+    "mean": 29.041369512194734,
+    "max_lag": 4,
+    "naive_se": 3.4745342729986968,
+    "newey_west_se": 5.247960786040248,
+    "se_inflation_ratio": 1.5104069707480523,
+    "t_statistic_nw": 5.533838894041616,
+    "p_value_two_sided": 3.1329676186686584e-08,
+    "ci_95": [
+      18.755366371555848,
+      39.32737265283362
+    ],
+    "n_time_bins": 82,
+    "bin_size_minutes": 5
+  }
+}

@@ -1,8 +1,6 @@
-(.venv) hramstad@Henrys-Mac-mini NYSE-XDP % ./build/market_maker_sim data/uncompr*/*.pcap data/symbol_nyse_parsed.csv
-
 Load distribution (MB per group):
   Group 1: 5118.6 MB (4 files)
-  Group 2: 5104.4 MB (14 files)
+  Group 2: 5103.8 MB (13 files)
   Group 3: 5118.8 MB (5 files)
   Group 4: 5106.2 MB (6 files)
   Group 5: 5106.8 MB (8 files)
@@ -16,10 +14,10 @@ Load distribution (MB per group):
   Group 13: 5107.2 MB (15 files)
   Group 14: 5106.9 MB (15 files)
 === HFT Market Maker Simulation (HYBRID) ===
-PCAP files: 122
+PCAP files: 121
 Process groups: 14
   Group 1: 4 files
-  Group 2: 14 files
+  Group 2: 13 files
   Group 3: 5 files
   Group 4: 6 files
   Group 5: 8 files
@@ -35,20 +33,20 @@ Process groups: 14
 
 Spawning child processes...
 [Group 1] Starting with 4 files
-[Group 2] Starting with 14 files
+[Group 2] Starting with 13 files
 [Group 3] Starting with 5 files
 [Group 4] Starting with 6 files
 [Group 5] Starting with 8 files
 [Group 6] Starting with 6 files
 [Group 7] Starting with 7 files
-[Group 8] Starting with 7 files
 [Group 9] Starting with 7 files
+[Group 8] Starting with 7 files
 [Group 10] Starting with 15 files
-[Group [Group 12] Starting with 711 files
-] Starting with 6 files
-[Group 13] Starting with 15 files
+[Group 11] Starting with 6 files
+[Group 12] Starting with 7 files
 Waiting for 14 child processes...
 [Group 14] Starting with 15 files
+[Group 13] Starting with 15 files
 Loaded 12249 symbol mappings from data/symbol_nyse_parsed.csv
 Loaded 12249 symbol mappings from data/symbol_nyse_parsed.csv
 Loaded 12249 symbol mappings from data/symbol_nyse_parsed.csv
@@ -61,68 +59,95 @@ Loaded 12249 symbol mappings from data/symbol_nyse_parsed.csv
 Loaded 12249 symbol mappings from data/symbol_nyse_parsed.csv
 Loaded 12249 symbol mappings from data/symbol_nyse_parsed.csv
 Loaded 12249 symbol mappings from data/symbol_nyse_parsed.csv
-[Group 2] Failed to open: data/symbol_nyse_parsed.csv
 Loaded 12249 symbol mappings from data/symbol_nyse_parsed.csv
 Loaded 12249 symbol mappings from data/symbol_nyse_parsed.csv
-[Group 2] File 10/14 (92741 pkts, total 472164)
+[Group 2] File 10/13 (282880 pkts, total 755044)
 [Group 13] File 10/15 (80204 pkts, total 831451)
 [Group 10] File 10/15 (558734 pkts, total 1075324)
 [Group 14] File 10/15 (557448 pkts, total 1078667)
 [Group 3] File 5/5 (227643 pkts, total 9415081)
-[Group 3] Aggregation done: 9415081 pkts, 9920 syms, baseline $-138.855, toxicity $38.497
+[Group 3] Aggregation done: 9415081 pkts, 9920 syms, baseline $-138.855, toxicity $38.497, baseline_adv $-7.11647, baseline_inv_var 24073.9, tox_inv_var 3584.21
 [Group 3] Results written to shared memory
+[Group 3] Wrote fills CSV: documentation/analysis_output/fills_group_3.csv
+[Group 3] Wrote symbols CSV: documentation/analysis_output/symbols_group_3.csv
 [Group 3/14] Completed: 9415081 packets, 107114877 msgs
 [Group 5] File 8/8 (204895 pkts, total 22821366)
-[Group 5] Aggregation done: 22821366 pkts, 9825 syms, baseline $-1117.82, toxicity $58.3096
+[Group 5] Aggregation done: 22821366 pkts, 9825 syms, baseline $-1117.82, toxicity $58.3096, baseline_adv $-30.9077, baseline_inv_var 44717.1, tox_inv_var 13126.4
 [Group 5] Results written to shared memory
+[Group 5] Wrote fills CSV: documentation/analysis_output/fills_group_5.csv
+[Group 5] Wrote symbols CSV: documentation/analysis_output/symbols_group_5.csv
 [Group 5/14] Completed: 22821366 packets, 87615165 msgs
 [Group 1] File 4/4 (187595 pkts, total 18299901)
-[Group 1] Aggregation done: 18299901 pkts, 9878 syms, baseline $-2654.63, toxicity $74.6535
+[Group 1] Aggregation done: 18299901 pkts, 9878 syms, baseline $-2654.63, toxicity $74.6535, baseline_adv $-35.6548, baseline_inv_var 45092.9, tox_inv_var 13732.9
 [Group 1] Results written to shared memory
+[Group 1] Wrote fills CSV: documentation/analysis_output/fills_group_1.csv
+[Group 1] Wrote symbols CSV: documentation/analysis_output/symbols_group_1.csv
 [Group 1/14] Completed: 18299901 packets, 94689353 msgs
 [Group 6] File 6/6 (188460 pkts, total 22736565)
-[Group 6] Aggregation done: 22736565 pkts, 9809 syms, baseline $-1866.19, toxicity $46.2901
+[Group 6] Aggregation done: 22736565 pkts, 9809 syms, baseline $-1866.19, toxicity $46.2901, baseline_adv $-49.5109, baseline_inv_var 40337, tox_inv_var 16305
 [Group 6] Results written to shared memory
+[Group 6] Wrote fills CSV: documentation/analysis_output/fills_group_6.csv
+[Group 6] Wrote symbols CSV: documentation/analysis_output/symbols_group_6.csv
 [Group 6/14] Completed: 22736565 packets, 88059306 msgs
 [Group 14] File 15/15 (208438 pkts, total 15478907)
-[Group 14] Aggregation done: 15478907 pkts, 10079 syms, baseline $-482.232, toxicity $49.3787
+[Group 14] Aggregation done: 15478907 pkts, 10079 syms, baseline $-482.232, toxicity $49.3787, baseline_adv $-11.0505, baseline_inv_var 51441.8, tox_inv_var 8861.34
 [Group 14] Results written to shared memory
+[Group 14] Wrote fills CSV: documentation/analysis_output/fills_group_14.csv
+[Group 14] Wrote symbols CSV: documentation/analysis_output/symbols_group_14.csv
 [Group 14/14] Completed: 15478907 packets, 97561517 msgs
 [Group 4] File 6/6 (197570 pkts, total 24334376)
-[Group 4] Aggregation done: 24334376 pkts, 9859 syms, baseline $-453.873, toxicity $47.2267
+[Group 4] Aggregation done: 24334376 pkts, 9859 syms, baseline $-453.873, toxicity $47.2267, baseline_adv $-9.65205, baseline_inv_var 57419.7, tox_inv_var 15857.2
 [Group 4] Results written to shared memory
+[Group 4] Wrote fills CSV: documentation/analysis_output/fills_group_4.csv
+[Group 4] Wrote symbols CSV: documentation/analysis_output/symbols_group_4.csv
 [Group 4/14] Completed: 24334376 packets, 85571608 msgs
 [Group 13] File 15/15 (5793428 pkts, total 25648550)
-[Group 13] Aggregation done: 25648550 pkts, 10028 syms, baseline $-614.566, toxicity $41.2532
+[Group 13] Aggregation done: 25648550 pkts, 10028 syms, baseline $-614.566, toxicity $41.2532, baseline_adv $-10.4588, baseline_inv_var 22798.2, tox_inv_var 5097.11
 [Group 13] Results written to shared memory
+[Group 13] Wrote fills CSV: documentation/analysis_output/fills_group_13.csv
+[Group 13] Wrote symbols CSV: documentation/analysis_output/symbols_group_13.csv
 [Group 13/14] Completed: 25648550 packets, 82362915 msgs
 [Group 9] File 7/7 (210705 pkts, total 26606902)
-[Group 9] Aggregation done: 26606902 pkts, 10010 syms, baseline $-1690.57, toxicity $44.705
+[Group 9] Aggregation done: 26606902 pkts, 10010 syms, baseline $-1690.57, toxicity $44.705, baseline_adv $-26.8168, baseline_inv_var 40658.4, tox_inv_var 14771.9
 [Group 9] Results written to shared memory
+[Group 9] Wrote fills CSV: documentation/analysis_output/fills_group_9.csv
+[Group 9] Wrote symbols CSV: documentation/analysis_output/symbols_group_9.csv
 [Group 9/14] Completed: 26606902 packets, 82104329 msgs
 [Group 8] File 7/7 (217950 pkts, total 21301890)
-[Group 8] Aggregation done: 21301890 pkts, 10011 syms, baseline $-570.408, toxicity $30.7426
+[Group 8] Aggregation done: 21301890 pkts, 10011 syms, baseline $-570.408, toxicity $30.7426, baseline_adv $-7.15671, baseline_inv_var 121032, tox_inv_var 4178.44
 [Group 8] Results written to shared memory
+[Group 8] Wrote fills CSV: documentation/analysis_output/fills_group_8.csv
+[Group 8] Wrote symbols CSV: documentation/analysis_output/symbols_group_8.csv
 [Group 8/14] Completed: 21301890 packets, 91055850 msgs
 [Group 10] File 15/15 (204216 pkts, total 25306618)
-[Group 10] Aggregation done: 25306618 pkts, 10023 syms, baseline $-672.251, toxicity $39.6358
+[Group 10] Aggregation done: 25306618 pkts, 10023 syms, baseline $-672.251, toxicity $39.6358, baseline_adv $-8.5164, baseline_inv_var 89877.6, tox_inv_var 4112.7
 [Group 10] Results written to shared memory
+[Group 10] Wrote fills CSV: documentation/analysis_output/fills_group_10.csv
+[Group 10] Wrote symbols CSV: documentation/analysis_output/symbols_group_10.csv
 [Group 10/14] Completed: 25306618 packets, 83007637 msgs
 [Group 12] File 7/7 (223877 pkts, total 24007873)
-[Group 12] Aggregation done: 24007873 pkts, 9870 syms, baseline $-1013.11, toxicity $38.3371
+[Group 12] Aggregation done: 24007873 pkts, 9870 syms, baseline $-1013.11, toxicity $38.3371, baseline_adv $-9.15675, baseline_inv_var 50166.1, tox_inv_var 6159.77
 [Group 12] Results written to shared memory
+[Group 12] Wrote fills CSV: documentation/analysis_output/fills_group_12.csv
+[Group 12] Wrote symbols CSV: documentation/analysis_output/symbols_group_12.csv
 [Group 12/14] Completed: 24007873 packets, 85853948 msgs
 [Group 11] File 6/6 (196675 pkts, total 21593767)
-[Group 11] Aggregation done: 21593767 pkts, 9860 syms, baseline $-733.379, toxicity $49.4823
+[Group 11] Aggregation done: 21593767 pkts, 9860 syms, baseline $-733.379, toxicity $49.4823, baseline_adv $-8.75632, baseline_inv_var 25736, tox_inv_var 6330.25
 [Group 11] Results written to shared memory
+[Group 11] Wrote fills CSV: documentation/analysis_output/fills_group_11.csv
+[Group 11] Wrote symbols CSV: documentation/analysis_output/symbols_group_11.csv
 [Group 11/14] Completed: 21593767 packets, 89972387 msgs
 [Group 7] File 7/7 (216962 pkts, total 9883738)
-[Group 7] Aggregation done: 9883738 pkts, 10851 syms, baseline $-1813.48, toxicity $105.338
+[Group 7] Aggregation done: 9883738 pkts, 10851 syms, baseline $-1813.48, toxicity $105.338, baseline_adv $-44.7281, baseline_inv_var 41273.2, tox_inv_var 8201.92
 [Group 7] Results written to shared memory
+[Group 7] Wrote fills CSV: documentation/analysis_output/fills_group_7.csv
+[Group 7] Wrote symbols CSV: documentation/analysis_output/symbols_group_7.csv
 [Group 7/14] Completed: 9883738 packets, 106537591 msgs
-[Group 2] File 14/14 (497384 pkts, total 21278169)
-[Group 2] Aggregation done: 21278169 pkts, 9908 syms, baseline $-2520.92, toxicity $127.863
+[Group 2] File 13/13 (497384 pkts, total 21278169)
+[Group 2] Aggregation done: 21278169 pkts, 9908 syms, baseline $-2520.92, toxicity $127.863, baseline_adv $-80.1508, baseline_inv_var 236343, tox_inv_var 7596.2
 [Group 2] Results written to shared memory
+[Group 2] Wrote fills CSV: documentation/analysis_output/fills_group_2.csv
+[Group 2] Wrote symbols CSV: documentation/analysis_output/symbols_group_2.csv
 [Group 2/14] Completed: 21278169 packets, 88329441 msgs
 
 Child processes finished: 14 completed, 0 failed
@@ -130,10 +155,10 @@ Aggregating results...
 Groups with valid results: 14/14
 
 === PERFORMANCE STATISTICS ===
-Total processing time: 213.19 seconds
+Total processing time: 217.27 seconds
 Total packets: 288713703
 Total messages: 1269835924
-Throughput: 1354281 packets/sec, 5956470 msgs/sec
+Throughput: 1328849 packets/sec, 5844614 msgs/sec
 Process groups: 14
 Unique symbols (sum): 139931
 
@@ -146,64 +171,27 @@ Baseline fills: 21233
 Toxicity fills: 4671
 Quotes suppressed: 19154
 Adverse fills: 1600
+Baseline adverse fills: 7132
 Total adverse penalty: $-95.56
-(.venv) hramstad@Henrys-Mac-mini NYSE-XDP % ./build/market_maker_sim data/uncompr*/*.pcap data/symbol_nyse_parsed.csv 2>&1 | python scripts/analyze_results.py
+Baseline adverse penalty: $-339.63
 
- ======================================================================
-MARKET MAKER SIMULATION STATISTICAL ANALYSIS
-======================================================================
+=== HYPOTHESIS TESTING METRICS ===
+Average Baseline Inventory Variance: 63640.54
+Average Toxicity Inventory Variance: 9136.81
+Inventory Variance Reduction: 85.64%
 
---- P&L SUMMARY ---
-Baseline Strategy PnL:     $  -16,342.28
-Toxicity Strategy PnL:     $      791.71
-Strategy Improvement:      $   17,133.99 (+104.84%)
-
---- FILL ANALYSIS ---
-Baseline Fills:                  21,233
-Toxicity Fills:                   4,671
-Quotes Suppressed:               19,154
-Fill Rate:                       19.61%
-Suppression Rate:                80.39%
-Adverse Fill Rate:               34.25%
-PnL per Fill (Toxicity):   $      0.1695
-PnL per Fill (Baseline):   $     -0.7697
-
---- ADVERSE SELECTION ---
-Adverse Fills:                    1,600
-Total Adverse Penalty:     $      -95.56
-Avg Adverse per Fill:      $     -0.0597
-
---- STATISTICAL ANALYSIS ---
-Number of Groups:                    14
-Mean Group PnL:            $       56.55
-Std Dev Group PnL:         $       27.84
-
-Intra-Day Sharpe Ratio:           2.031
-Annualized Sharpe (est):         32.248
-T-Statistic (vs 0):               7.601
-Statistical Power (α=0.05):       1.000
-Sample Size for 80% Power:            2
-95% CI for Mean PnL:       [$41.97, $71.13]
-
---- THROUGHPUT ---
-Total Packets:              288,713,703
-Total Messages:            1,269,835,924
-Processing Time:                  211.0 sec
-Packets/sec:                  1,368,292
-Messages/sec:                 6,018,094
-
---- SCALING ANALYSIS ---
-Process Groups Used:                 14
-Unique Symbols (sum):           139,931
-Msgs per Group:              90,702,566
-
---- P&L SCALING PROJECTIONS ---
-(Based on linear scaling assumptions)
-
-Current Daily PnL (100 share quotes):  $      791.71
-With 1,000 share quotes:
-  Daily:  $    7,917.10  |  Annual: $1,995,109.20
-With 5,000 share quotes:
-  Daily:  $   39,585.50  |  Annual: $9,975,546.00
-With 10,000 share quotes:
-  Daily:  $   79,171.00  |  Annual: $19,951,092.00
+=== PER-GROUP RESULTS (FOR HYPOTHESIS TESTING) ===
+Group 1: baseline_pnl=-2654.6273, toxicity_pnl=74.6535, baseline_adv=-35.6548, toxicity_adv=-16.3263, baseline_inv_var=45092.9112, toxicity_inv_var=13732.9147
+Group 2: baseline_pnl=-2520.9177, toxicity_pnl=127.8629, baseline_adv=-80.1508, toxicity_adv=-13.2978, baseline_inv_var=236343.1861, toxicity_inv_var=7596.1954
+Group 3: baseline_pnl=-138.8547, toxicity_pnl=38.4970, baseline_adv=-7.1165, toxicity_adv=-3.7160, baseline_inv_var=24073.8503, toxicity_inv_var=3584.2109
+Group 4: baseline_pnl=-453.8728, toxicity_pnl=47.2267, baseline_adv=-9.6521, toxicity_adv=-5.5292, baseline_inv_var=57419.6743, toxicity_inv_var=15857.1792
+Group 5: baseline_pnl=-1117.8222, toxicity_pnl=58.3096, baseline_adv=-30.9077, toxicity_adv=-11.6766, baseline_inv_var=44717.1080, toxicity_inv_var=13126.4012
+Group 6: baseline_pnl=-1866.1909, toxicity_pnl=46.2901, baseline_adv=-49.5109, toxicity_adv=-7.7107, baseline_inv_var=40336.9897, toxicity_inv_var=16304.9533
+Group 7: baseline_pnl=-1813.4754, toxicity_pnl=105.3378, baseline_adv=-44.7281, toxicity_adv=-11.7637, baseline_inv_var=41273.1872, toxicity_inv_var=8201.9241
+Group 8: baseline_pnl=-570.4081, toxicity_pnl=30.7426, baseline_adv=-7.1567, toxicity_adv=-2.7456, baseline_inv_var=121032.4871, toxicity_inv_var=4178.4375
+Group 9: baseline_pnl=-1690.5748, toxicity_pnl=44.7050, baseline_adv=-26.8168, toxicity_adv=-3.2796, baseline_inv_var=40658.3662, toxicity_inv_var=14771.9267
+Group 10: baseline_pnl=-672.2508, toxicity_pnl=39.6358, baseline_adv=-8.5164, toxicity_adv=-3.6984, baseline_inv_var=89877.6173, toxicity_inv_var=4112.7047
+Group 11: baseline_pnl=-733.3793, toxicity_pnl=49.4823, baseline_adv=-8.7563, toxicity_adv=-5.6300, baseline_inv_var=25736.0401, toxicity_inv_var=6330.2535
+Group 12: baseline_pnl=-1013.1061, toxicity_pnl=38.3371, baseline_adv=-9.1568, toxicity_adv=-2.1426, baseline_inv_var=50166.0940, toxicity_inv_var=6159.7667
+Group 13: baseline_pnl=-614.5660, toxicity_pnl=41.2532, baseline_adv=-10.4588, toxicity_adv=-4.4790, baseline_inv_var=22798.2106, toxicity_inv_var=5097.1066
+Group 14: baseline_pnl=-482.2323, toxicity_pnl=49.3787, baseline_adv=-11.0505, toxicity_adv=-3.5688, baseline_inv_var=51441.8158, toxicity_inv_var=8861.3353

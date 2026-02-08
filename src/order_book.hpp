@@ -32,35 +32,33 @@ public:
     uint32_t high_precision_price_count = 0; // Prices with > 2 decimal places
     uint32_t resistance_level_count = 0;     // Prices ending in .95, .99, .98, .01, .05
 
-    [[nodiscard]] double get_toxicity_score() const noexcept {
+    struct FeatureRatios {
+      double cancel_ratio = 0.0;
+      double ping_ratio = 0.0;
+      double odd_lot_ratio = 0.0;
+      double precision_ratio = 0.0;
+      double resistance_ratio = 0.0;
+    };
+
+    [[nodiscard]] FeatureRatios get_feature_ratios() const noexcept {
+      FeatureRatios fr;
       uint32_t total_events = adds + cancels;
       if (total_events == 0)
-        return 0.0;
+        return fr;
+      double te = static_cast<double>(total_events);
+      fr.cancel_ratio = static_cast<double>(cancels) / te;
+      fr.ping_ratio = static_cast<double>(ping_count) / te;
+      fr.odd_lot_ratio = static_cast<double>(odd_lot_count) / te;
+      fr.precision_ratio = static_cast<double>(high_precision_price_count) / te;
+      fr.resistance_ratio = static_cast<double>(resistance_level_count) / te;
+      return fr;
+    }
 
-      double score = 0.0;
-
-      // Factor 1: Cancel/Add ratio (0.0 to 1.0, weighted 40%)
-      double cancel_ratio = static_cast<double>(cancels) / static_cast<double>(total_events);
-      score += cancel_ratio * 0.4;
-
-      // Factor 2: Ping ratio (small orders < 10, weighted 20%)
-      double ping_ratio = static_cast<double>(ping_count) / static_cast<double>(total_events);
-      score += ping_ratio * 0.2;
-
-      // Factor 3: Odd lot ratio (non-round volumes, weighted 15%)
-      double odd_lot_ratio = static_cast<double>(odd_lot_count) / static_cast<double>(total_events);
-      score += odd_lot_ratio * 0.15;
-
-      // Factor 4: High precision price ratio (weighted 15%)
-      double precision_ratio =
-          static_cast<double>(high_precision_price_count) / static_cast<double>(total_events);
-      score += precision_ratio * 0.15;
-
-      // Factor 5: Resistance level ratio (weighted 10%)
-      double resistance_ratio =
-          static_cast<double>(resistance_level_count) / static_cast<double>(total_events);
-      score += resistance_ratio * 0.1;
-
+    [[nodiscard]] double get_toxicity_score() const noexcept {
+      auto fr = get_feature_ratios();
+      double score = fr.cancel_ratio * 0.4 + fr.ping_ratio * 0.2 +
+                     fr.odd_lot_ratio * 0.15 + fr.precision_ratio * 0.15 +
+                     fr.resistance_ratio * 0.1;
       return std::min(score, 1.0);
     }
 
@@ -286,6 +284,19 @@ public:
       }
     }
     return 0.0;
+  }
+
+  // Get raw feature ratios for a price level
+  [[nodiscard]] ToxicityMetrics::FeatureRatios get_feature_ratios(double price, char side) const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (side == 'B') {
+      auto it = bid_toxicity_.find(price);
+      if (it != bid_toxicity_.end()) return it->second.get_feature_ratios();
+    } else {
+      auto it = ask_toxicity_.find(price);
+      if (it != ask_toxicity_.end()) return it->second.get_feature_ratios();
+    }
+    return ToxicityMetrics::FeatureRatios();
   }
 
   // Get detailed toxicity metrics for a price level
