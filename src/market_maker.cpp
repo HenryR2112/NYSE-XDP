@@ -24,7 +24,7 @@ double MarketMakerStrategy::calculate_toxicity_adjusted_spread(
 
   double toxicity_sum = 0.0;
   int toxicity_count = 0;
-  constexpr int levels_to_check = 5;
+  constexpr int levels_to_check = 3;
 
   auto bids = order_book_.get_bids();
   auto asks = order_book_.get_asks();
@@ -114,27 +114,68 @@ void MarketMakerStrategy::clear_override_toxicity() {
   override_toxicity_ = 0.0;
 }
 
+// Snapshot-based helpers: operate on pre-fetched data (no additional lock acquisitions)
+
+double MarketMakerStrategy::get_average_toxicity_snap(const OrderBook::BookSnapshot& snap) const {
+  if (use_override_toxicity_) {
+    return override_toxicity_;
+  }
+  double toxicity_sum = 0.0;
+  int toxicity_count = 0;
+  for (int i = 0; i < snap.num_bid_levels; i++) {
+    toxicity_sum += snap.bid_levels[i].toxicity_score;
+    toxicity_count++;
+  }
+  for (int i = 0; i < snap.num_ask_levels; i++) {
+    toxicity_sum += snap.ask_levels[i].toxicity_score;
+    toxicity_count++;
+  }
+  return (toxicity_count > 0) ? toxicity_sum / toxicity_count : 0.0;
+}
+
+double MarketMakerStrategy::calculate_toxicity_adjusted_spread_snap(
+    double base_spread_val, const OrderBook::BookSnapshot& snap) const {
+  if (!use_toxicity_screen_) {
+    return base_spread_val;
+  }
+  if (snap.stats.best_bid == 0.0 || snap.stats.best_ask == 0.0) {
+    return base_spread_val;
+  }
+  double avg_toxicity = get_average_toxicity_snap(snap);
+  double adjusted_spread =
+      base_spread_val * (1.0 + avg_toxicity * toxicity_spread_multiplier_);
+  return std::clamp(adjusted_spread, min_spread_, max_spread_);
+}
+
+double MarketMakerStrategy::calculate_obi_snap(const OrderBook::BookSnapshot& snap) {
+  double total_qty = static_cast<double>(snap.stats.total_bid_qty + snap.stats.total_ask_qty);
+  if (total_qty < 1.0) return 0.0;
+  return (static_cast<double>(snap.stats.total_bid_qty) -
+          static_cast<double>(snap.stats.total_ask_qty)) / total_qty;
+}
+
 void MarketMakerStrategy::update_market_data() {
-  // Calculate OBI and toxicity before acquiring strategy lock
-  // (these methods acquire the order book lock internally)
+  // Single lock acquisition: capture all needed book state at once
+  auto snap = order_book_.get_snapshot();
+
+  // Calculate OBI and toxicity from snapshot (no further lock acquisitions)
   double avg_toxicity = 0.0;
   double obi = 0.0;
 
   if (use_toxicity_screen_) {
-    avg_toxicity = get_average_toxicity();
-    obi = calculate_obi();
+    avg_toxicity = get_average_toxicity_snap(snap);
+    obi = calculate_obi_snap(snap);
   }
 
   std::lock_guard<std::mutex> lock(strategy_mutex_);
-  auto book_stats = order_book_.get_stats();
 
-  if (book_stats.best_bid == 0.0 || book_stats.best_ask == 0.0) {
+  if (snap.stats.best_bid == 0.0 || snap.stats.best_ask == 0.0) {
     current_quotes_.is_quoted = false;
     return;
   }
 
-  double mid_price = book_stats.mid_price;
-  double spread = calculate_toxicity_adjusted_spread(base_spread_);
+  double mid_price = snap.stats.mid_price;
+  double spread = calculate_toxicity_adjusted_spread_snap(base_spread_, snap);
   double half_spread = spread / 2.0;
   double inventory_skew = calculate_inventory_skew();
 
@@ -218,8 +259,7 @@ void MarketMakerStrategy::update_market_data() {
   current_quotes_.is_quoted = (current_quotes_.bid_size > 0 || current_quotes_.ask_size > 0);
 
   // Update unrealized PnL
-  double last_trade = order_book_.get_last_trade();
-  const double mark = (last_trade > 0.0) ? last_trade : mid_price;
+  const double mark = (snap.last_traded_price > 0.0) ? snap.last_traded_price : mid_price;
 
   if (inventory_ > 0) {
     unrealized_pnl_ = (mark - avg_entry_price_) * static_cast<double>(inventory_);
@@ -381,19 +421,10 @@ void MarketMakerStrategy::reset() {
   our_order_ids_.clear();
   stats_ = MarketMakerStats();
   stats_.start_time = std::chrono::steady_clock::now();
-  toxicity_window_ = ToxicityWindow();
-  toxicity_window_.start_time = std::chrono::steady_clock::now();
 }
 
 double MarketMakerStrategy::sigmoid(double x) const noexcept {
   return 1.0 / (1.0 + std::exp(-x));
-}
-
-double MarketMakerStrategy::calculate_toxicity_score(double cancel_rate, double obi, double short_vol) const noexcept {
-  // Equation (8) from strategy proposal
-  // p_toxic = σ(α1 · r_cancel + α2 · |OBI| + α3 · σ_short)
-  double score = alpha1_ * cancel_rate + alpha2_ * std::abs(obi) + alpha3_ * short_vol;
-  return sigmoid(score);
 }
 
 double MarketMakerStrategy::calculate_expected_pnl(double spread, double toxicity, double inventory_risk) const noexcept {

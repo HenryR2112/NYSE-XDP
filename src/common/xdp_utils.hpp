@@ -50,9 +50,10 @@ namespace xdp {
                                                    uint32_t nanoseconds) {
   char buffer[64];
   time_t t = static_cast<time_t>(seconds);
-  struct tm *tm_info = localtime(&t);
+  struct tm tm_storage;
+  localtime_r(&t, &tm_storage);
 
-  strftime(buffer, sizeof(buffer), "%H:%M:%S", tm_info);
+  strftime(buffer, sizeof(buffer), "%H:%M:%S", &tm_storage);
 
   char result[80];
   uint32_t microseconds = nanoseconds / 1000;

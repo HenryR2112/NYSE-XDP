@@ -261,21 +261,6 @@ void process_xdp_message(const uint8_t *data, size_t max_len,
 
   // Filter by ticker if specified
   if (!filter_ticker.empty()) {
-    // Debug: Show sample symbols encountered (first 10 unique ones)
-    static std::unordered_set<std::string> seen_symbols;
-    static std::mutex seen_symbols_mutex;
-    if (seen_symbols.size() < 10) {
-      std::lock_guard<std::mutex> lock(seen_symbols_mutex);
-      if (seen_symbols.find(ticker) == seen_symbols.end() &&
-          seen_symbols.size() < 10) {
-        seen_symbols.insert(ticker);
-        if (seen_symbols.size() <= 5) {
-          std::cout << "Sample symbol encountered: " << ticker
-                    << " (index: " << symbol_index << ")" << std::endl;
-        }
-      }
-    }
-
     if (ticker != filter_ticker) {
       return; // Skip this message - doesn't match filter
     }
@@ -502,12 +487,6 @@ void parse_xdp_packet(const uint8_t *data, size_t length) {
     offset += msg_size;
   }
 
-  // Debug output every 10000 packets
-  if (packets_parsed.load() % 10000 == 0) {
-    std::cout << "Debug: Parsed " << packets_parsed.load() << " XDP packets, "
-              << messages_parsed.load() << " messages, "
-              << messages_processed.load() << " matched filter" << std::endl;
-  }
 }
 
 // PCAP packet handler

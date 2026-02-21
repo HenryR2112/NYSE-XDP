@@ -23,7 +23,9 @@ import itertools
 from pathlib import Path
 
 
-def find_pcap_files(data_dir="data/uncompressed-ny4-xnyx-pillar-a-20230822"):
+def find_pcap_files(data_dir=None):
+    if data_dir is None:
+        data_dir = "data/uncompressed-ny4-xnyx-pillar-a-20230822"
     """Find all PCAP files in data directory."""
     pcaps = sorted(Path(data_dir).glob("*.pcap"))
     return [str(p) for p in pcaps]
@@ -105,17 +107,25 @@ def run_simulation(sim_binary, pcap_files, symbol_file, params, threads=14,
 def main():
     sim_binary = "build/market_maker_sim"
     symbol_file = "data/symbol_nyse_parsed.csv"
+    output_path = "documentation/parameter_sensitivity.json"
+    data_dir = None
     online_learning = False
 
     for arg_idx, arg in enumerate(sys.argv[1:], 1):
         if arg == "--sim-binary" and arg_idx < len(sys.argv) - 1:
             sim_binary = sys.argv[arg_idx + 1]
+        elif arg == "--symbol-file" and arg_idx < len(sys.argv) - 1:
+            symbol_file = sys.argv[arg_idx + 1]
+        elif arg == "--output" and arg_idx < len(sys.argv) - 1:
+            output_path = sys.argv[arg_idx + 1]
+        elif arg == "--data-dir" and arg_idx < len(sys.argv) - 1:
+            data_dir = sys.argv[arg_idx + 1]
         elif arg == "--online-learning":
             online_learning = True
 
-    pcap_files = find_pcap_files()
+    pcap_files = find_pcap_files(data_dir)
     if not pcap_files:
-        print("No PCAP files found in data/", file=sys.stderr)
+        print("No PCAP files found", file=sys.stderr)
         sys.exit(1)
 
     print(f"Found {len(pcap_files)} PCAP files")
@@ -158,7 +168,6 @@ def main():
                 print(" FAILED")
 
     # Save results
-    output_path = "documentation/parameter_sensitivity.json"
     with open(output_path, 'w') as f:
         json.dump(results, f, indent=2)
     print(f"\nResults saved to {output_path}")

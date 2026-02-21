@@ -18,6 +18,7 @@ import sys
 import csv
 import json
 import math
+from math import erf
 import random
 import statistics
 from collections import defaultdict
@@ -187,7 +188,6 @@ def spearman_rank_correlation(fills: List[dict]) -> dict:
     # Approximate t-test for significance
     t_stat = rho * math.sqrt((n - 2) / (1 - rho ** 2)) if abs(rho) < 1.0 else float('inf')
     # Normal approximation for p-value
-    from math import erf
     z = abs(t_stat)
     p_value = 2 * (1 - 0.5 * (1 + erf(z / math.sqrt(2))))
 
@@ -253,7 +253,6 @@ def per_feature_correlation(fills: List[dict]) -> dict:
         else:
             rho = cov / (std_rf * std_ra)
             t_stat = rho * math.sqrt((n - 2) / (1 - rho ** 2)) if abs(rho) < 1.0 else float('inf')
-            from math import erf
             z = abs(t_stat)
             p_value = 2 * (1 - 0.5 * (1 + erf(z / math.sqrt(2))))
 
@@ -385,7 +384,6 @@ def newey_west_se(values: List[float], max_lag: int = None) -> dict:
 
     # t-statistic with NW standard errors
     t_stat = mean / nw_se if nw_se > 0 else float('inf')
-    from math import erf
     p_value = 2 * (1 - 0.5 * (1 + erf(abs(t_stat) / math.sqrt(2))))
 
     return {
@@ -438,7 +436,10 @@ def time_series_analysis(fills: List[dict]) -> dict:
             pnl = -pnl  # Bought at fill_price, value at mid
         tox_bin_pnl[bin_idx] += pnl + fill['adverse_pnl']
 
-    # Filter out empty bins
+    # Filter out empty bins: zero-PnL bins represent 5-minute windows with no trading
+    # activity. Including them would artificially deflate the HAC standard error.
+    # Note: if a bin had fills that net to exactly $0.00, it would be incorrectly
+    # discarded; this is acceptable given the rarity of such exact cancellation.
     nonempty_bins = [p for p in tox_bin_pnl if p != 0.0]
 
     if len(nonempty_bins) < 5:

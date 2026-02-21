@@ -244,7 +244,7 @@ def main():
     }
 
     # Save JSON report
-    report_path = 'documentation/hypothesis_test_results.json'
+    report_path = sys.argv[2] if len(sys.argv) > 2 else 'documentation/hypothesis_test_results.json'
     with open(report_path, 'w') as jf:
         json.dump(out, jf, indent=2)
 

@@ -21,7 +21,7 @@
 \newtheorem{corollary}{Corollary}[section]
 
 \title{Toxicity-Screened High-Frequency Market-Making: \\An Optimal Control Framework with Empirical Validation}
-\author{(Author) \\
+\author{Henry Ramstad \\
  Repository: \texttt{NYSE-XDP} \\
  Key file: \texttt{market\_maker.hpp}}
 \date{\today}
@@ -30,7 +30,17 @@
 \maketitle
 
 \begin{abstract}
-We extend the Avellaneda-Stoikov (2008) optimal control framework with real-time adverse selection screening via a toxicity score---a logistic function of eight microstructure features with weights initialized from domain priors and validated via online stochastic gradient descent (SGD), which confirms the initialization is near-optimal---that dynamically adjusts quoted spreads. Empirical evaluation on 74GB of NYSE XDP Integrated Feed data (1.27 billion messages, August 22, 2023) reveals that naive market-making incurs \$16,342 in losses, establishing toxicity screening as \emph{necessary} for viability. The toxicity-aware strategy achieves an intraday Sharpe of 2.03 versus $-1.45$ for baseline ($p < 0.001$), with 72\% adverse selection reduction and 86\% inventory variance reduction. Per-feature analysis reveals that cancellation rate alone ($\rho = 0.116$) accounts for nearly all predictive power; three temporal features (trade flow imbalance, spread dynamics, price momentum) and online weight adaptation do not improve the composite signal ($\rho = 0.118$, $p < 10^{-10}$). Symbol-level bootstrap across 3,731 active symbols confirms robustness (95\% CI: [\$747, \$837]). The strategy remains profitable across all tested parameter combinations in sensitivity analysis.
+\noindent\textbf{Objective.}
+Evaluate whether real-time toxicity screening can improve market-making profitability on NYSE equity markets.
+%
+\textbf{Method.}
+We extend the Avellaneda-Stoikov optimal control framework with an online SGD logistic model for order flow toxicity estimation, backtested on 74\,GB of NYSE XDP Integrated Feed data (1.27 billion messages, August 22, 2023) and compared against an unscreened baseline.
+%
+\textbf{Results.}
+Naive market-making incurs \$16,342 in losses; the toxicity-aware strategy achieves +\$792 net P\&L, a \$17,134 improvement. Intraday Sharpe ratio improves from $-1.45$ (baseline) to 2.03 (screened, $p < 0.001$). Adverse selection decreases 71.9\% ($p = 0.00025$) and inventory variance decreases 85.6\% ($p = 0.00019$). The toxicity score has Spearman $\rho = 0.118$ with realized adverse selection ($p < 10^{-10}$), with cancellation rate alone accounting for $\rho = 0.116$. Symbol-level bootstrap across 3,731 active symbols confirms robustness (95\% CI: [\$747, \$837]).
+%
+\textbf{Conclusions.}
+Loss avoidance (\$16,342) is the dominant mechanism, not alpha generation (\$792). Online SGD learning does not improve over static weight initialization---a negative result confirming the initialization is near-optimal. Only 47.2\% of individual symbols improve; portfolio-level profitability emerges from cross-sectional diversification. Results are robust across all tested parameter combinations but limited to a single trading day.
 \end{abstract}
 
 \section{Introduction and Problem Formulation}
@@ -168,7 +178,7 @@ When our quote is filled:
 \item Fill price equals our quoted price (price-time priority, we assume sufficient queue priority)
 \item Fill size is $\min\{V_t, V_{market}\}$ where $V_{market}$ is the incoming market order size
 \item Execution occurs after a latency $\ell \sim \mathcal{N}(\mu_\ell, \sigma_\ell^2)$ (in microseconds)
-\item Queue position ahead of us: $Q_{ahead} \sim \text{Lognormal}(\mu_q, \sigma_q^2)$ shares
+\item Queue position ahead of us: $Q_{ahead} \sim \mathcal{N}(\mu_q, \sigma_q^2)$ shares, truncated at zero
 \end{enumerate}
 \end{assumption}
 
@@ -345,7 +355,7 @@ For computational tractability, we employ a threshold-based rule:
 |Q_t| < Q_{\max}
 \end{cases}
 \end{equation}
-where $T_{\text{threshold}} \in (0,1)$ and $\epsilon_{\text{min}} > 0$ are tuning parameters.
+where $T_{\text{threshold}} \in (0,1)$ and $\epsilon_{\text{min}} = 0.0005$ (\$0.05 per 100 shares) are tuning parameters.
 
 \section{Inventory Management and Skewing}
 
@@ -418,9 +428,9 @@ where $\mu_\ell = 5$ microseconds and $\sigma_\ell = 1$ microsecond, reflecting 
 
 At price level $p$, the visible depth is $D(p) = \sum_{(p', v') \in \mathcal{B}_t \cup \mathcal{A}_t : p' = p} v'$. Our queue position (shares ahead of us) is modeled as:
 \begin{equation}
-Q_{\text{ahead}} \sim \text{Lognormal}(\mu_q, \sigma_q^2)
+Q_{\text{ahead}} \sim \max\!\left(0,\; \mathcal{N}(\phi \cdot D(p),\; (\phi \cdot D(p) \cdot \sigma_q)^2)\right)
 \end{equation}
-where $\mu_q = \log(\phi \cdot D(p))$ and $\phi = 0.005$ reflects elite HFT front-of-queue positioning (top 0.5\%).
+where $\phi = 0.005$ reflects elite HFT front-of-queue positioning (top 0.5\%) and $\sigma_q = 0.1$ controls variance relative to the mean queue position. The distribution is truncated at zero to ensure non-negative queue depth.
 
 \subsection{Fill Probability}
 
@@ -437,7 +447,7 @@ V_{\text{fill}} = \min\{V_t - Q_{\text{ahead}}, V_{\text{market}} - Q_{\text{ahe
 
 \subsection{Adverse Selection Measurement}
 
-After a fill at time $t$, we measure adverse price movement over a lookforward window $[t, t+\tau]$ (typically $\tau = 500$ microseconds):
+After a fill at time $t$, we measure adverse price movement over a lookforward window $[t, t+\tau]$ ($\tau = 250$ microseconds):
 \begin{equation}
 \text{Adverse}_{t+\tau} = \begin{cases}
 \max\{0, P_t - P_{t+\tau}\} & \text{if buy fill} \\
@@ -501,19 +511,19 @@ The market-making strategy is implemented as a high-performance C++17 simulation
 \item Inventory position and skew computation
 \item Expected P\&L evaluation
 \end{itemize}
-Quote updates are rate-limited to a configurable interval (default 50 $\mu$s) to model realistic HFT infrastructure constraints.
+Quote updates are rate-limited to a configurable interval (default 10 $\mu$s) to model realistic HFT infrastructure constraints.
 
 \item \textbf{Execution Simulation Module}: Simulates order fills with:
 \begin{itemize}
 \item Latency modeling: $\ell \sim \mathcal{N}(\mu_\ell, \sigma_\ell^2)$ with $\mu_\ell = 5\mu s$ (elite FPGA-based HFT)
 \item Queue position: fraction $\phi = 0.005$ (top 0.5\%) of visible depth with low variance ($\sigma_q = 0.1$)
 \item Fill determination: price crossing + queue priority + latency activation
-\item Adverse selection: lookforward measurement over configurable window (default 500$\mu$s)
+\item Adverse selection: lookforward measurement over configurable window (default 250$\mu$s)
 \end{itemize}
 
-\item \textbf{P\&L Accounting}: Tracks realized/unrealized P\&L using weighted-average cost basis, including maker rebates (\$0.002/share), clearing fees (\$0.00015/share), and adverse selection penalties (3\% of measured adverse movement).
+\item \textbf{P\&L Accounting}: Tracks realized/unrealized P\&L using weighted-average cost basis, including maker rebates (\$0.0025/share), clearing fees (\$0.00008/share), and adverse selection penalties (3\% of measured adverse movement).
 
-\item \textbf{Risk Management}: Enforces per-symbol position limits (5,000 shares), daily loss limits (\$500), and portfolio-wide kill switches (\$50,000).
+\item \textbf{Risk Management}: Enforces per-symbol position limits (50,000 shares), daily loss limits (\$5,000), and portfolio-wide kill switches (\$500,000).
 \end{enumerate}
 
 \subsection{Simulation Protocol}
@@ -527,7 +537,7 @@ The simulation executes the following protocol per process group:
 
 \item \textbf{Message Handling}: Extract symbol index, acquire sharded lock, update order book state based on message type (ADD, MODIFY, DELETE, EXECUTE, REPLACE), invoke quote engine on EXECUTE events.
 
-\item \textbf{Quote Decision Engine}: Rate-limited to 50$\mu$s intervals. Compute toxicity score, order book imbalance, and inventory skew. Generate quotes: $p^{bid} = P_t - \Delta_t(\hat{T}_t)/2 + \kappa_{inv}(\rho_t)$. Update virtual order state.
+\item \textbf{Quote Decision Engine}: Rate-limited to 10$\mu$s intervals. Compute toxicity score, order book imbalance, and inventory skew. Generate quotes: $p^{bid} = P_t - \Delta_t(\hat{T}_t)/2 + \kappa_{inv}(\rho_t)$. Update virtual order state.
 
 \item \textbf{Fill Simulation}: Check quote activation and price eligibility. Consume queue position from execution volume. If remaining volume reaches our position, execute fill and update inventory/P\&L.
 
@@ -552,7 +562,7 @@ The simulation system is designed for high throughput on commodity hardware. Per
 \item \textbf{Scaling efficiency}: Near-linear to 8 processes, diminishing returns beyond due to memory bandwidth saturation
 \end{itemize}
 
-The build system uses \texttt{-O3 -march=native -flto -ffast-math} for aggressive optimization including auto-vectorization and link-time optimization.
+The build system uses \texttt{-O3 -march=native -flto} for aggressive optimization including auto-vectorization and link-time optimization, with IEEE 754 floating-point semantics preserved for reproducibility.
 
 \subsection{Baseline Comparison}
 
@@ -573,6 +583,7 @@ Q_{\max} &= 100,000 \text{ shares (inventory limit)} \\
 T_{\text{threshold}} &= 0.75 \text{ (very high threshold, almost always quote)} \\
 \text{OBI}_{\text{threshold}} &= 0.50 \text{ (only skip on extreme OBI)} \\
 \mathbf{w}_0 &= (0.4, 0.2, 0.15, 0.15, 0.1, 0, 0, 0) \text{ (initial SGD weights, see Section~4.3)} \\
+\epsilon_{\min} &= 0.0005 \text{ (minimum expected PnL to quote, \$0.05 per 100 shares)} \\
 \mu_{adv} &= 0.003 \text{ (very low adverse expectation, excellent hedging)} \\
 \gamma_{\text{risk}} &= 0.0005 \text{ (very low inventory risk penalty)} \\
 P_{\text{fill}} &= 0.35 \text{ (35\% expected fill rate, front of queue)} \\
@@ -655,7 +666,7 @@ The SGD model's learned weights converge to values near the initialization $\mat
 
 \subsubsection{Parameter Sensitivity}
 
-Given \$792 of total profit, the margin between viability and loss is narrow. We conduct one-at-a-time sensitivity analysis across four key parameters, varying each across a realistic range while holding others at default values.
+Given \$792 of total profit, the margin between viability and loss is narrow. We conduct one-at-a-time (OAT) sensitivity analysis across four key parameters, varying each across a realistic range while holding others at default values. This approach does not capture multi-parameter interactions; a full factorial or Latin hypercube design would be needed to characterize interaction effects. However, the single dominant parameter ($\chi$, accounting for 48\% profit variation versus $\leq$17\% for all others) suggests that interaction effects are likely second-order relative to the main effect of the adverse selection multiplier.
 
 \begin{table}[H]
 \centering
@@ -919,6 +930,7 @@ $\mathbf{w}$ & SGD-learned weight vector \\
 $b$ & SGD bias term \\
 $\mathbf{x}_t$ & Microstructure feature vector ($\mathbb{R}^8$) \\
 $\eta_t$ & Decaying learning rate \\
+$\epsilon_{\min}$ & Minimum expected PnL threshold for quoting ($5 \times 10^{-4}$) \\
 $\mu_{adv}$ & Adverse selection parameter \\
 $\gamma_{\text{risk}}$ & Inventory risk coefficient \\
 $P_{\text{fill}}$ & Fill probability \\

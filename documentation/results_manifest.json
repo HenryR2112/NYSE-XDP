@@ -1,0 +1,61 @@
+{
+  "generated": "2026-02-20",
+  "git_hash": "cd452982acaa241e89dd81df5e9ad468dd33c191",
+  "pipeline": "scripts/reproduce.sh",
+  "claims": {
+    "baseline_total_pnl": {
+      "value": -16342.28,
+      "source": "documentation/hypothesis_test_results.json",
+      "field": "extras.Baseline Total PnL"
+    },
+    "toxicity_total_pnl": {
+      "value": 791.71,
+      "source": "documentation/hypothesis_test_results.json",
+      "field": "extras.Toxicity Total PnL"
+    },
+    "pnl_improvement": {
+      "value": 17133.99,
+      "source": "computed: toxicity - baseline"
+    },
+    "spearman_rho": {
+      "value": 0.118,
+      "source": "documentation/analysis_output/advanced_analysis.json",
+      "field": "spearman_correlation.spearman_rho"
+    },
+    "bootstrap_ci": {
+      "value": [747, 837],
+      "source": "documentation/analysis_output/advanced_analysis.json",
+      "field": "symbol_bootstrap.bootstrap_ci_95_toxicity_pnl"
+    },
+    "hac_t_statistic": {
+      "value": 5.53,
+      "source": "documentation/analysis_output/advanced_analysis.json",
+      "field": "hac_standard_errors.t_statistic_nw"
+    },
+    "sharpe_toxicity": {
+      "value": 2.031,
+      "source": "documentation/hypothesis_test_results.json",
+      "field": "tests.Sharpe Improvement.sharpe_toxicity"
+    },
+    "sharpe_baseline": {
+      "value": -1.454,
+      "source": "documentation/hypothesis_test_results.json",
+      "field": "tests.Sharpe Improvement.sharpe_baseline"
+    },
+    "adverse_reduction": {
+      "value": "71.9%",
+      "source": "documentation/hypothesis_test_results.json",
+      "field": "tests.Adverse Selection Reduction.reduction_pct"
+    },
+    "inventory_variance_reduction": {
+      "value": "85.6%",
+      "source": "documentation/hypothesis_test_results.json",
+      "field": "tests.Inventory Variance Reduction.reduction_pct"
+    },
+    "cancel_ratio_rho": {
+      "value": 0.116,
+      "source": "documentation/analysis_output/advanced_analysis.json",
+      "field": "per_feature_correlation.features[0].spearman_rho"
+    }
+  }
+}

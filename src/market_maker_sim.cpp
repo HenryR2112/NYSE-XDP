@@ -2,766 +2,55 @@
 // Simulates market making strategies on historical XDP data
 // PARALLELIZED VERSION - Uses all available CPU cores for maximum throughput
 
+#include "per_symbol_sim.hpp"
+
 #include "common/mmap_pcap_reader.hpp"
 #include "common/pcap_reader.hpp"
 #include "common/symbol_map.hpp"
 #include "common/thread_pool.hpp"
 #include "common/xdp_types.hpp"
 #include "common/xdp_utils.hpp"
-#include "market_maker.hpp"
-#include "order_book.hpp"
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
-#include <cmath>
-#include <csignal>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <limits>
 #include <mutex>
-#include <random>
-#include <regex>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
-#include <unordered_map>
 #include <vector>
+
+using namespace mmsim;
 
 namespace {
 
+// =============================================================================
+// Global State
+// =============================================================================
+
 std::string g_filter_ticker;
-std::string g_output_dir;    // Output directory for CSV files (empty = no CSV output)
 bool g_use_parallel = true;  // Enable parallel processing by default
 bool g_use_hybrid = true;    // Enable hybrid multi-process mode by default
 size_t g_num_threads = 0;    // 0 = auto-detect (use all cores)
 size_t g_files_per_group = 0; // 0 = auto (num_files / num_threads)
-double g_toxicity_threshold = 0.0;   // 0 = use default from market_maker.hpp
-double g_toxicity_multiplier = 0.0;  // 0 = use default from market_maker.hpp
-bool g_online_learning = false;      // Enable online SGD toxicity model
-double g_learning_rate = 0.01;       // Base learning rate for SGD
-int g_warmup_fills = 50;             // Fills before SGD kicks in
+
+SimConfig g_config;  // Runtime simulation configuration
 
 // =============================================================================
-// HFT Market Maker Execution Model
-// Assumes: Elite HFT with FPGA, microwave links, and top-of-book priority
-// =============================================================================
-
-struct ExecutionModelConfig {
-  uint64_t seed = 42;
-
-  // --- Latency Model (Elite HFT - Sub-10μs) ---
-  // 5μs one-way = FPGA + kernel bypass + direct exchange feed
-  // 1μs jitter (hardware timestamping, isolated cores)
-  double latency_us_mean = 5.0;           // 5 microseconds one-way
-  double latency_us_jitter = 1.0;         // Minimal jitter
-  uint64_t quote_update_interval_us = 10; // Can update quotes every 10μs
-
-  // --- Queue Position Model ---
-  // Elite HFT: effectively at front of queue
-  // 0.5% = if 5000 shares at level, only ~25 shares ahead
-  double queue_position_fraction = 0.005; // Top 0.5% (near front of queue)
-  double queue_position_variance = 0.1;   // Very consistent
-
-  // --- Adverse Selection Model ---
-  // Excellent ability to detect and hedge adverse flow
-  uint64_t adverse_lookforward_us = 250;  // 250μs lookforward (faster reaction)
-  double adverse_selection_multiplier = 0.03; // Only 3% realized (excellent hedging)
-
-  // --- Quote Exposure Window ---
-  uint64_t quote_exposure_window_us = 10; // 10μs exposure
-
-  // --- Fee/Rebate Structure (NYSE Tier 1 maker) ---
-  double maker_rebate_per_share = 0.0025;  // $0.0025/share (top-tier volume)
-  double taker_fee_per_share = 0.003;      // Pay $0.003/share if we cross
-  double clearing_fee_per_share = 0.00008; // Volume discount on clearing
-
-  // --- Risk Limits ---
-  double max_position_per_symbol = 50000.0; // Max 50k shares per symbol
-  double max_daily_loss_per_symbol = 5000.0; // Stop trading after $5k loss
-  double max_portfolio_loss = 500000.0;     // Kill switch at $500k loss
-
-  // --- Symbol Selection Criteria ---
-  double min_spread_to_trade = 0.01;       // Trade penny spreads
-  double max_spread_to_trade = 0.20;       // Trade wider spreads too (more edge)
-  uint32_t min_depth_to_trade = 100;       // Lower threshold (more symbols)
-
-  // Legacy compatibility
-  enum class FillMode { Cross, Match } fill_mode = FillMode::Cross;
-};
-
-ExecutionModelConfig g_exec;
-
-// ---- Feature Trackers (circular buffers for online learning) ----
-
-struct TradeFlowTracker {
-  static constexpr int WINDOW = 100;
-  struct Trade { bool is_buy; uint32_t volume; };
-  std::array<Trade, WINDOW> buffer = {};
-  int head = 0;
-  int count = 0;
-
-  void record_trade(bool is_buy, uint32_t volume) {
-    buffer[head] = {is_buy, volume};
-    head = (head + 1) % WINDOW;
-    if (count < WINDOW) count++;
-  }
-
-  double get_imbalance() const {
-    if (count == 0) return 0.0;
-    double buy_vol = 0.0, sell_vol = 0.0;
-    for (int i = 0; i < count; i++) {
-      const auto& t = buffer[i];
-      if (t.is_buy) buy_vol += t.volume;
-      else sell_vol += t.volume;
-    }
-    double total = buy_vol + sell_vol;
-    return (total > 0) ? (buy_vol - sell_vol) / total : 0.0;
-  }
-};
-
-struct SpreadTracker {
-  static constexpr int WINDOW = 50;
-  std::array<double, WINDOW> buffer = {};
-  int head = 0;
-  int count = 0;
-
-  void record_spread(double spread) {
-    buffer[head] = spread;
-    head = (head + 1) % WINDOW;
-    if (count < WINDOW) count++;
-  }
-
-  double get_spread_change_rate() const {
-    if (count < 2) return 0.0;
-    double current = buffer[(head - 1 + WINDOW) % WINDOW];
-    int oldest_idx = (count < WINDOW) ? 0 : head;
-    double oldest = buffer[oldest_idx];
-    return (oldest > 1e-10) ? (current - oldest) / oldest : 0.0;
-  }
-};
-
-struct MomentumTracker {
-  static constexpr int WINDOW = 50;
-  std::array<double, WINDOW> buffer = {};
-  int head = 0;
-  int count = 0;
-
-  void record_mid(double mid) {
-    buffer[head] = mid;
-    head = (head + 1) % WINDOW;
-    if (count < WINDOW) count++;
-  }
-
-  double get_momentum() const {
-    if (count < 2) return 0.0;
-    double current = buffer[(head - 1 + WINDOW) % WINDOW];
-    int oldest_idx = (count < WINDOW) ? 0 : head;
-    double oldest = buffer[oldest_idx];
-    return (oldest > 1e-10) ? (current - oldest) / oldest : 0.0;
-  }
-};
-
-struct VirtualOrder {
-  double price = 0.0;
-  uint32_t size = 0;
-  uint32_t remaining = 0;
-  uint64_t active_at_ns = 0;       // When order becomes active (after latency)
-  uint64_t exposed_until_ns = 0;  // Stale quote exposure window
-  uint32_t queue_ahead = 0;
-  bool live = false;
-};
-
-struct StrategyExecState {
-  VirtualOrder bid;
-  VirtualOrder ask;
-};
-
-// Track fills for adverse selection measurement
-struct FillRecord {
-  uint64_t fill_time_ns;
-  double fill_price;
-  uint32_t fill_qty;
-  bool is_buy;
-  double mid_price_at_fill;
-  double toxicity_at_fill = 0.0;  // Toxicity score at time of fill
-  bool adverse_measured = false;
-  double adverse_pnl = 0.0;
-  ToxicityFeatureVector features;  // Per-fill feature vector for online learning
-};
-
-// Per-symbol risk state
-struct SymbolRiskState {
-  double realized_pnl = 0.0;
-  double unrealized_pnl = 0.0;
-  bool halted = false;  // Stopped due to loss limit
-  int64_t total_fills = 0;
-  double total_adverse_pnl = 0.0;
-  int64_t adverse_fills = 0;
-
-  // Inventory variance tracking (Welford's online algorithm)
-  double inv_mean = 0.0;
-  double inv_m2 = 0.0;   // Sum of squared differences from mean
-  int64_t inv_count = 0; // Number of inventory samples
-
-  void update_inventory_variance(double inventory) {
-    inv_count++;
-    double delta = inventory - inv_mean;
-    inv_mean += delta / static_cast<double>(inv_count);
-    double delta2 = inventory - inv_mean;
-    inv_m2 += delta * delta2;
-  }
-
-  double get_inventory_variance() const {
-    if (inv_count < 2) return 0.0;
-    return inv_m2 / static_cast<double>(inv_count - 1);
-  }
-};
-
-struct PerSymbolSim {
-  OrderBook order_book_baseline;
-  OrderBook order_book_toxicity;
-  MarketMakerStrategy mm_baseline;
-  MarketMakerStrategy mm_toxicity;
-
-  // Track order details for queue position updates on cancel/execute
-  struct OrderInfo {
-    char side;
-    double price;
-    uint32_t volume;
-    uint64_t add_time_ns;  // Track when order was added for cleanup
-  };
-  std::unordered_map<uint64_t, OrderInfo> order_info;
-  uint64_t last_cleanup_ns = 0;
-
-  bool initialized = false;
-  bool eligible_to_trade = true;  // Passes symbol selection criteria
-  uint32_t symbol_index = 0;
-  std::mt19937_64 rng;
-  std::normal_distribution<double> latency_us_dist;
-  std::uniform_real_distribution<double> uni01;
-
-  StrategyExecState baseline_state;
-  StrategyExecState toxicity_state;
-  uint64_t last_quote_update_ns = 0;
-
-  // Risk tracking
-  SymbolRiskState baseline_risk;
-  SymbolRiskState toxicity_risk;
-
-  // Adverse selection tracking - store recent fills to measure post-fill movement
-  std::vector<FillRecord> baseline_pending_fills;
-  std::vector<FillRecord> toxicity_pending_fills;
-
-  // Completed fills with measured adverse_pnl (for CSV output)
-  std::vector<FillRecord> baseline_completed_fills;
-  std::vector<FillRecord> toxicity_completed_fills;
-
-  // Online learning feature trackers and model
-  OnlineToxicityModel online_model;
-  TradeFlowTracker trade_flow;
-  SpreadTracker spread_tracker;
-  MomentumTracker momentum_tracker;
-
-  PerSymbolSim()
-      : order_book_baseline(), order_book_toxicity(),
-        mm_baseline(order_book_baseline, false),
-        mm_toxicity(order_book_toxicity, true), order_info(),
-        latency_us_dist(0.0, 1.0), uni01(0.0, 1.0) {}
-
-  void ensure_init(uint32_t idx) {
-    if (initialized)
-      return;
-    initialized = true;
-    symbol_index = idx;
-
-    const uint64_t seed =
-        g_exec.seed ^ (static_cast<uint64_t>(idx) * 0x9E3779B97F4A7C15ULL);
-    rng.seed(seed);
-
-    // Microsecond latency distribution for HFT
-    latency_us_dist = std::normal_distribution<double>(
-        g_exec.latency_us_mean, g_exec.latency_us_jitter);
-
-    // Net fee = maker_rebate - clearing_fee (we receive rebate, pay clearing)
-    double net_fee = -(g_exec.maker_rebate_per_share - g_exec.clearing_fee_per_share);
-    mm_baseline.set_fee_per_share(net_fee);
-    mm_toxicity.set_fee_per_share(net_fee);
-
-    // Apply CLI-overridden toxicity parameters
-    if (g_toxicity_threshold > 0.0) {
-      mm_toxicity.set_toxicity_threshold(g_toxicity_threshold);
-    }
-    if (g_toxicity_multiplier > 0.0) {
-      mm_toxicity.set_toxicity_multiplier(g_toxicity_multiplier);
-    }
-
-    // Initialize online learning model with CLI params
-    if (g_online_learning) {
-      online_model = OnlineToxicityModel(g_learning_rate, g_warmup_fills);
-    }
-  }
-
-  uint64_t sample_latency_ns() {
-    double us = latency_us_dist(rng);
-    if (us < 5.0) us = 5.0;  // Minimum 5μs even with colo
-    return static_cast<uint64_t>(us * 1000.0);  // Convert μs to ns
-  }
-
-  // Calculate queue position based on visible depth at price level
-  uint32_t calculate_queue_position(double price, char side) {
-    uint32_t visible_depth = 0;
-    if (side == 'B') {
-      auto bids = order_book_toxicity.get_bids();
-      auto it = bids.find(price);
-      if (it != bids.end()) visible_depth = it->second;
-    } else {
-      auto asks = order_book_toxicity.get_asks();
-      auto it = asks.find(price);
-      if (it != asks.end()) visible_depth = it->second;
-    }
-
-    if (visible_depth == 0) return 0;
-
-    // Our queue position is a fraction of visible depth with variance
-    double base_position = visible_depth * g_exec.queue_position_fraction;
-    double variance = base_position * g_exec.queue_position_variance;
-    std::normal_distribution<double> pos_dist(base_position, variance);
-    double pos = pos_dist(rng);
-    return static_cast<uint32_t>(std::max(0.0, pos));
-  }
-
-  // Check if symbol meets eligibility criteria
-  bool check_eligibility() {
-    auto stats = order_book_toxicity.get_stats();
-
-    // Need valid BBO
-    if (stats.best_bid <= 0 || stats.best_ask <= 0) return false;
-
-    // Check spread requirements
-    if (stats.spread < g_exec.min_spread_to_trade) return false;
-    if (stats.spread > g_exec.max_spread_to_trade) return false;
-
-    // Check depth requirements
-    if (stats.total_bid_qty < g_exec.min_depth_to_trade) return false;
-    if (stats.total_ask_qty < g_exec.min_depth_to_trade) return false;
-
-    return true;
-  }
-
-  // Check if we've hit loss limits
-  bool check_risk_limits(SymbolRiskState& risk) {
-    double total_pnl = risk.realized_pnl + risk.unrealized_pnl + risk.total_adverse_pnl;
-    if (total_pnl < -g_exec.max_daily_loss_per_symbol) {
-      risk.halted = true;
-      return false;
-    }
-    return true;
-  }
-
-  // Build current feature vector from order book and trackers
-  ToxicityFeatureVector build_feature_vector() {
-    ToxicityFeatureVector fv;
-
-    // Average the 5 order-book features across top 3 bid + 3 ask levels
-    constexpr int levels = 3;
-    int count = 0;
-    auto bids = order_book_toxicity.get_bids();
-    auto asks = order_book_toxicity.get_asks();
-
-    int bid_levels = 0;
-    for (const auto& [price, qty] : bids) {
-      if (bid_levels >= levels) break;
-      auto fr = order_book_toxicity.get_feature_ratios(price, 'B');
-      fv.features[0] += fr.cancel_ratio;
-      fv.features[1] += fr.ping_ratio;
-      fv.features[2] += fr.odd_lot_ratio;
-      fv.features[3] += fr.precision_ratio;
-      fv.features[4] += fr.resistance_ratio;
-      count++;
-      bid_levels++;
-    }
-    int ask_levels = 0;
-    for (const auto& [price, qty] : asks) {
-      if (ask_levels >= levels) break;
-      auto fr = order_book_toxicity.get_feature_ratios(price, 'S');
-      fv.features[0] += fr.cancel_ratio;
-      fv.features[1] += fr.ping_ratio;
-      fv.features[2] += fr.odd_lot_ratio;
-      fv.features[3] += fr.precision_ratio;
-      fv.features[4] += fr.resistance_ratio;
-      count++;
-      ask_levels++;
-    }
-    if (count > 0) {
-      for (int i = 0; i < 5; i++) fv.features[i] /= count;
-    }
-
-    // New temporal features
-    fv.features[5] = trade_flow.get_imbalance();
-    fv.features[6] = spread_tracker.get_spread_change_rate();
-    fv.features[7] = momentum_tracker.get_momentum();
-
-    return fv;
-  }
-
-  // Measure adverse selection on pending fills
-  void measure_adverse_selection(std::vector<FillRecord>& fills,
-                                  std::vector<FillRecord>* completed,
-                                  SymbolRiskState& risk,
-                                  uint64_t now_ns) {
-    auto stats = order_book_toxicity.get_stats();
-    double current_mid = stats.mid_price;
-
-    for (auto& fill : fills) {
-      if (fill.adverse_measured) continue;
-
-      // Check if enough time has passed
-      uint64_t elapsed_us = (now_ns - fill.fill_time_ns) / 1000;
-      if (elapsed_us < g_exec.adverse_lookforward_us) continue;
-
-      // Mark as measured even if we can't calculate (to allow cleanup)
-      fill.adverse_measured = true;
-
-      // Skip adverse calculation if no valid mid price
-      if (current_mid <= 0) continue;
-
-      // Measure adverse price movement
-      double price_change = current_mid - fill.mid_price_at_fill;
-
-      // For buys: adverse if price went down after we bought
-      // For sells: adverse if price went up after we sold
-      double adverse_move = fill.is_buy ? -price_change : price_change;
-
-      if (adverse_move > 0) {
-        // We got adversely selected - charge a fraction of the move
-        fill.adverse_pnl = -adverse_move * fill.fill_qty *
-                           g_exec.adverse_selection_multiplier;
-        risk.total_adverse_pnl += fill.adverse_pnl;
-        risk.adverse_fills++;
-      }
-
-      // Train online model: label = was there meaningful adverse selection?
-      if (g_online_learning) {
-        bool was_adverse = (adverse_move > 0.005);  // > half a cent threshold
-        online_model.update(fill.features, was_adverse);
-      }
-    }
-
-    // Clean up old measured fills - also force cleanup if vector is too large
-    if (fills.size() > 10000) {
-      // Emergency cleanup - mark old fills as measured
-      for (size_t i = 0; i < fills.size() - 5000; i++) {
-        fills[i].adverse_measured = true;
-      }
-    }
-
-    // Move measured fills to completed vector (for CSV output) before erasing
-    if (completed) {
-      for (auto& f : fills) {
-        if (f.adverse_measured) {
-          completed->push_back(std::move(f));
-        }
-      }
-    }
-
-    fills.erase(
-        std::remove_if(fills.begin(), fills.end(),
-                       [](const FillRecord& f) { return f.adverse_measured; }),
-        fills.end());
-  }
-
-  bool eligible_for_fill(double quote_px, double exec_px,
-                         bool is_bid_side) const {
-    if (g_exec.fill_mode == ExecutionModelConfig::FillMode::Match) {
-      return std::abs(quote_px - exec_px) < 1e-12;
-    }
-    return is_bid_side ? (quote_px >= exec_px) : (quote_px <= exec_px);
-  }
-
-  void update_virtual_order(VirtualOrder &vo, double price, uint32_t size,
-                            char side, uint64_t now_ns) {
-    const bool price_changed = vo.price != price;
-    const bool changed = (!vo.live) || price_changed ||
-                         (vo.size != size) || (vo.remaining == 0);
-    if (!changed)
-      return;
-
-    uint64_t latency_ns = sample_latency_ns();
-
-    // If we're changing price, there's an exposure window where stale quote is live
-    if (vo.live && price_changed) {
-      vo.exposed_until_ns = now_ns + g_exec.quote_exposure_window_us * 1000;
-    }
-
-    vo.price = price;
-    vo.size = size;
-    vo.remaining = size;
-    // Calculate queue position based on current visible depth at this price
-    vo.queue_ahead = calculate_queue_position(price, side);
-    vo.active_at_ns = now_ns + latency_ns;
-    vo.live = (price > 0.0 && size > 0);
-  }
-
-  void update_quotes(uint64_t now_ns) {
-    uint64_t quote_interval_ns = g_exec.quote_update_interval_us * 1000;
-    if (now_ns - last_quote_update_ns < quote_interval_ns)
-      return;
-    last_quote_update_ns = now_ns;
-
-    // Measure adverse selection on any pending fills
-    // Pass completed vectors for CSV output when output directory is set
-    auto* bc = g_output_dir.empty() ? nullptr : &baseline_completed_fills;
-    auto* tc = g_output_dir.empty() ? nullptr : &toxicity_completed_fills;
-    measure_adverse_selection(baseline_pending_fills, bc, baseline_risk, now_ns);
-    measure_adverse_selection(toxicity_pending_fills, tc, toxicity_risk, now_ns);
-
-    // Update spread and momentum trackers
-    {
-      auto book_stats = order_book_toxicity.get_stats();
-      if (book_stats.spread > 0) spread_tracker.record_spread(book_stats.spread);
-      if (book_stats.mid_price > 0) momentum_tracker.record_mid(book_stats.mid_price);
-    }
-
-    // Check eligibility and risk limits
-    eligible_to_trade = check_eligibility();
-    if (!eligible_to_trade) return;
-
-    if (!check_risk_limits(baseline_risk) || !check_risk_limits(toxicity_risk)) {
-      return;
-    }
-
-    // Feed online model prediction to toxicity strategy
-    if (g_online_learning && !online_model.in_warmup()) {
-      auto fv = build_feature_vector();
-      double predicted_toxicity = online_model.predict(fv);
-      mm_toxicity.set_override_toxicity(predicted_toxicity);
-    }
-
-    mm_baseline.update_market_data();
-    mm_toxicity.update_market_data();
-
-    const MarketMakerQuote q_base = mm_baseline.get_current_quotes();
-    const MarketMakerQuote q_tox = mm_toxicity.get_current_quotes();
-
-    update_virtual_order(baseline_state.bid, q_base.bid_price, q_base.bid_size,
-                         'B', now_ns);
-    update_virtual_order(baseline_state.ask, q_base.ask_price, q_base.ask_size,
-                         'S', now_ns);
-
-    update_virtual_order(toxicity_state.bid, q_tox.bid_price, q_tox.bid_size,
-                         'B', now_ns);
-    update_virtual_order(toxicity_state.ask, q_tox.ask_price, q_tox.ask_size,
-                         'S', now_ns);
-  }
-
-  void on_add(uint64_t order_id, double price, uint32_t volume, char side, uint64_t now_ns) {
-    order_info[order_id] = {side, price, volume, now_ns};
-    order_book_baseline.add_order(order_id, price, volume, side);
-    order_book_toxicity.add_order(order_id, price, volume, side);
-
-    // Periodic cleanup of stale orders (every 10 seconds of market time)
-    constexpr uint64_t CLEANUP_INTERVAL_NS = 10ULL * 1000000000ULL;  // 10 seconds
-    constexpr uint64_t MAX_ORDER_AGE_NS = 60ULL * 1000000000ULL;     // 60 seconds max age
-    if (now_ns - last_cleanup_ns > CLEANUP_INTERVAL_NS) {
-      last_cleanup_ns = now_ns;
-      // Remove orders older than MAX_ORDER_AGE_NS
-      for (auto it = order_info.begin(); it != order_info.end(); ) {
-        if (now_ns - it->second.add_time_ns > MAX_ORDER_AGE_NS) {
-          it = order_info.erase(it);
-        } else {
-          ++it;
-        }
-      }
-    }
-  }
-
-  void on_modify(uint64_t order_id, double price, uint32_t volume) {
-    auto it = order_info.find(order_id);
-    if (it != order_info.end()) {
-      // If price changed, treat old price level as cancel for queue purposes
-      if (std::abs(it->second.price - price) > 0.0001) {
-        update_queue_on_cancel(it->second.price, it->second.volume, it->second.side);
-      }
-      it->second.price = price;
-      it->second.volume = volume;
-    }
-    order_book_baseline.modify_order(order_id, price, volume);
-    order_book_toxicity.modify_order(order_id, price, volume);
-  }
-
-  // Helper to update queue positions when orders at our quote price cancel
-  void update_queue_on_cancel(double price, uint32_t volume, char side) {
-    auto update_vo = [&](VirtualOrder& vo, bool is_bid) {
-      if (!vo.live || vo.queue_ahead == 0) return;
-      // Only update if cancel is at our quote price and same side
-      if ((is_bid && side == 'B') || (!is_bid && side == 'S')) {
-        if (std::abs(vo.price - price) < 0.0001) {
-          // Order ahead of us cancelled - improve our queue position
-          vo.queue_ahead = (vo.queue_ahead > volume) ? (vo.queue_ahead - volume) : 0;
-        }
-      }
-    };
-
-    update_vo(baseline_state.bid, true);
-    update_vo(baseline_state.ask, false);
-    update_vo(toxicity_state.bid, true);
-    update_vo(toxicity_state.ask, false);
-  }
-
-  void on_delete(uint64_t order_id) {
-    auto it = order_info.find(order_id);
-    if (it != order_info.end()) {
-      // Update queue positions before removing order info
-      update_queue_on_cancel(it->second.price, it->second.volume, it->second.side);
-      order_info.erase(it);
-    }
-    order_book_baseline.delete_order(order_id);
-    order_book_toxicity.delete_order(order_id);
-  }
-
-  void on_replace(uint64_t old_order_id, uint64_t new_order_id, double price,
-                  uint32_t volume, char side, uint64_t now_ns) {
-    auto it = order_info.find(old_order_id);
-    if (it != order_info.end()) {
-      // Old order leaving queue - update queue positions
-      update_queue_on_cancel(it->second.price, it->second.volume, it->second.side);
-      order_info.erase(it);
-    }
-    order_info[new_order_id] = {side, price, volume, now_ns};
-
-    order_book_baseline.delete_order(old_order_id);
-    order_book_baseline.add_order(new_order_id, price, volume, side);
-    order_book_toxicity.delete_order(old_order_id);
-    order_book_toxicity.add_order(new_order_id, price, volume, side);
-  }
-
-  void try_fill_one(MarketMakerStrategy &mm, StrategyExecState &st,
-                    std::vector<FillRecord>& pending_fills,
-                    SymbolRiskState& risk,
-                    bool is_bid_side, double exec_price, uint32_t exec_qty,
-                    uint64_t now_ns) {
-    // Check if halted due to loss limits
-    if (risk.halted) return;
-
-    VirtualOrder &vo = is_bid_side ? st.bid : st.ask;
-    if (!vo.live || vo.remaining == 0)
-      return;
-
-    // Order must be active (past latency period)
-    if (now_ns < vo.active_at_ns)
-      return;
-
-    // Check price eligibility
-    if (!eligible_for_fill(vo.price, exec_price, is_bid_side))
-      return;
-
-    // During quote exposure window, we're more vulnerable to adverse fills
-    // Model this as higher fill probability (bad fills get through)
-    bool in_exposure_window = (now_ns < vo.exposed_until_ns);
-
-    // Queue position logic - must wait our turn
-    uint32_t qty_left = exec_qty;
-    if (vo.queue_ahead > 0 && !in_exposure_window) {
-      // Normal case: consume queue ahead of us
-      const uint32_t consume = std::min(vo.queue_ahead, qty_left);
-      vo.queue_ahead -= consume;
-      qty_left -= consume;
-    }
-    // During exposure window, skip queue logic (we get adversely picked off)
-
-    if (qty_left == 0)
-      return;
-
-    const uint32_t fill_qty = std::min(vo.remaining, qty_left);
-    if (fill_qty == 0)
-      return;
-
-    // Execute the fill
-    vo.remaining -= fill_qty;
-    mm.on_order_filled(is_bid_side, vo.price, fill_qty);
-    risk.total_fills++;
-
-    // Track inventory variance for hypothesis testing H3
-    risk.update_inventory_variance(mm.get_inventory());
-
-    // Record fill for adverse selection measurement
-    auto stats = order_book_toxicity.get_stats();
-    FillRecord record;
-    record.fill_time_ns = now_ns;
-    record.fill_price = vo.price;
-    record.fill_qty = fill_qty;
-    record.is_buy = is_bid_side;
-    record.mid_price_at_fill = stats.mid_price;
-
-    // Build feature vector and store with fill
-    record.features = build_feature_vector();
-
-    if (g_online_learning && !online_model.in_warmup()) {
-      record.toxicity_at_fill = online_model.predict(record.features);
-    } else {
-      record.toxicity_at_fill = mm.get_current_toxicity();
-    }
-    pending_fills.push_back(record);
-  }
-
-  void maybe_fill_on_execution(char resting_side, double exec_price,
-                               uint32_t exec_qty, uint64_t now_ns) {
-    update_quotes(now_ns);
-
-    // Skip if not eligible to trade this symbol
-    if (!eligible_to_trade) return;
-
-    if (resting_side == 'B') {
-      try_fill_one(mm_baseline, baseline_state, baseline_pending_fills,
-                   baseline_risk, true, exec_price, exec_qty, now_ns);
-      try_fill_one(mm_toxicity, toxicity_state, toxicity_pending_fills,
-                   toxicity_risk, true, exec_price, exec_qty, now_ns);
-      return;
-    }
-
-    if (resting_side == 'S') {
-      try_fill_one(mm_baseline, baseline_state, baseline_pending_fills,
-                   baseline_risk, false, exec_price, exec_qty, now_ns);
-      try_fill_one(mm_toxicity, toxicity_state, toxicity_pending_fills,
-                   toxicity_risk, false, exec_price, exec_qty, now_ns);
-    }
-  }
-
-  void on_execute(uint64_t order_id, uint32_t exec_qty, double exec_price,
-                  uint64_t now_ns) {
-    auto it = order_info.find(order_id);
-    if (it != order_info.end()) {
-      // Feed trade flow tracker with execution side
-      bool is_buy = (it->second.side == 'B');
-      trade_flow.record_trade(is_buy, exec_qty);
-
-      maybe_fill_on_execution(it->second.side, exec_price, exec_qty, now_ns);
-
-      // Update volume tracking (partial fills reduce remaining volume)
-      if (it->second.volume > exec_qty) {
-        it->second.volume -= exec_qty;
-      } else {
-        order_info.erase(it);
-      }
-    }
-
-    order_book_baseline.execute_order(order_id, exec_qty, exec_price);
-    order_book_toxicity.execute_order(order_id, exec_qty, exec_price);
-  }
-};
-
 // Thread-safe symbol simulation storage
 // Pre-allocated array for lock-free access (no hash map lookups during processing)
+// =============================================================================
+
 constexpr uint32_t MAX_SYMBOLS = 100000;
 std::unique_ptr<PerSymbolSim*[]> g_sims_array;       // Raw pointer array
-std::unique_ptr<std::atomic<bool>[]> g_sims_initialized;  // Atomic flags (raw array)
+std::unique_ptr<std::atomic<bool>[]> g_sims_initialized;  // Atomic flags
 
 // Sharded locks to reduce contention (64 shards = good balance)
 constexpr size_t NUM_LOCK_SHARDS = 64;
@@ -780,6 +69,17 @@ void init_symbol_storage() {
   for (size_t i = 0; i < MAX_SYMBOLS; ++i) {
     g_sims_array[i] = nullptr;
     g_sims_initialized[i].store(false, std::memory_order_relaxed);
+  }
+}
+
+// Clean up allocated PerSymbolSim objects
+void cleanup_symbol_storage() {
+  if (!g_sims_array) return;
+  for (size_t i = 0; i < MAX_SYMBOLS; ++i) {
+    if (g_sims_initialized[i].load(std::memory_order_relaxed)) {
+      delete g_sims_array[i];
+      g_sims_array[i] = nullptr;
+    }
   }
 }
 
@@ -817,6 +117,10 @@ void report_memory_stats() {
   std::cout << " [syms: " << g_active_symbols.load() << "]" << std::flush;
 }
 
+// =============================================================================
+// XDP Message Dispatch
+// =============================================================================
+
 void process_xdp_message(const uint8_t *data, size_t max_len, uint16_t msg_type,
                          uint64_t now_ns) {
   if (max_len < xdp::MESSAGE_HEADER_SIZE)
@@ -850,7 +154,7 @@ void process_xdp_message(const uint8_t *data, size_t max_len, uint16_t msg_type,
   // Use sharded lock for this symbol's updates
   std::lock_guard<std::mutex> sym_lock(get_shard_mutex(symbol_index));
 
-  sim.ensure_init(symbol_index);
+  sim.ensure_init(symbol_index, g_config);
 
   switch (msg_type) {
   case static_cast<uint16_t>(xdp::MessageType::ADD_ORDER): {
@@ -891,7 +195,7 @@ void process_xdp_message(const uint8_t *data, size_t max_len, uint16_t msg_type,
       uint32_t price_raw = xdp::read_le32(data + 28);
       uint32_t volume = xdp::read_le32(data + 32);
       double price = xdp::parse_price(price_raw);
-      g_total_executions++;
+      g_total_executions.fetch_add(1, std::memory_order_relaxed);
       sim.on_execute(order_id, volume, price, now_ns);
     }
     break;
@@ -914,6 +218,36 @@ void process_xdp_message(const uint8_t *data, size_t max_len, uint16_t msg_type,
     break;
   }
 }
+
+// =============================================================================
+// Unified packet processing callback
+// Used by all execution modes (hybrid, threaded, sequential)
+// =============================================================================
+
+void process_packet_callback(const uint8_t *data, size_t length,
+                             uint64_t /*packet_num*/,
+                             const xdp::NetworkPacketInfo &info) {
+  g_total_packets.fetch_add(1, std::memory_order_relaxed);
+
+  if (length < xdp::PACKET_HEADER_SIZE) return;
+
+  xdp::PacketHeader pkt_header;
+  if (!xdp::parse_packet_header(data, length, pkt_header)) return;
+
+  size_t offset = xdp::PACKET_HEADER_SIZE;
+  for (uint8_t i = 0; i < pkt_header.num_messages && offset < length; i++) {
+    if (offset + xdp::MESSAGE_HEADER_SIZE > length) break;
+    uint16_t msg_size = xdp::read_le16(data + offset);
+    if (msg_size < xdp::MESSAGE_HEADER_SIZE || offset + msg_size > length) break;
+    uint16_t msg_type = xdp::read_le16(data + offset + 2);
+    process_xdp_message(data + offset, msg_size, msg_type, info.timestamp_ns);
+    offset += msg_size;
+  }
+}
+
+// =============================================================================
+// Results Aggregation (non-hybrid mode)
+// =============================================================================
 
 void print_results() {
   struct Row {
@@ -995,7 +329,7 @@ void print_results() {
           : 0.0;
 
   std::cout << "\n=== HFT MARKET MAKER SIMULATION RESULTS ===\n";
-  std::cout << "Latency: " << g_exec.latency_us_mean << "μs (colo)\n";
+  std::cout << "Latency: " << g_config.exec.latency_us_mean << "μs (colo)\n";
   std::cout << "Symbols traded: " << rows.size() << '\n';
   std::cout << "Symbols ineligible: " << symbols_ineligible << '\n';
   std::cout << "Symbols halted (loss limit): " << symbols_halted << '\n';
@@ -1067,6 +401,10 @@ void print_results() {
   }
 }
 
+// =============================================================================
+// CLI Usage
+// =============================================================================
+
 void print_usage(const char *program) {
   std::cerr << "HFT Market Maker Simulation (HYBRID MULTI-PROCESS VERSION)\n\n"
             << "Usage: " << program << " <pcap_file(s)> [options]\n\n"
@@ -1078,15 +416,15 @@ void print_usage(const char *program) {
             << "  -t TICKER           Filter to single ticker\n"
             << "  -s, --symbols FILE  Symbol map file (default: data/symbol_nyse_parsed.csv)\n"
             << "  --seed N            Random seed\n"
-            << "  --latency-us M      One-way latency in microseconds (default: 20)\n"
-            << "  --latency-jitter-us J  Latency jitter (default: 5)\n"
-            << "  --queue-fraction F  Queue position as fraction of depth (default: 0.05)\n"
-            << "  --adverse-lookforward-us U  Adverse selection lookforward (default: 500)\n"
-            << "  --adverse-multiplier M  Adverse selection penalty multiplier (default: 0.10)\n"
-            << "  --maker-rebate R    Maker rebate per share (default: 0.002)\n"
-            << "  --max-position P    Max position per symbol (default: 5000)\n"
-            << "  --max-loss L        Max daily loss per symbol (default: 500)\n"
-            << "  --quote-interval-us Q  Quote update interval (default: 50)\n"
+            << "  --latency-us M      One-way latency in microseconds (default: 5)\n"
+            << "  --latency-jitter-us J  Latency jitter (default: 1)\n"
+            << "  --queue-fraction F  Queue position as fraction of depth (default: 0.005)\n"
+            << "  --adverse-lookforward-us U  Adverse selection lookforward (default: 250)\n"
+            << "  --adverse-multiplier M  Adverse selection penalty multiplier (default: 0.03)\n"
+            << "  --maker-rebate R    Maker rebate per share (default: 0.0025)\n"
+            << "  --max-position P    Max position per symbol (default: 50000)\n"
+            << "  --max-loss L        Max daily loss per symbol (default: 5000)\n"
+            << "  --quote-interval-us Q  Quote update interval (default: 10)\n"
             << "  --fill-mode M       Fill mode: cross or match (default: cross)\n"
             << "  --toxicity-threshold T  Toxicity threshold for quote suppression (default: 0.75)\n"
             << "  --toxicity-multiplier K  Toxicity spread multiplier (default: 1.0)\n"
@@ -1215,26 +553,6 @@ void process_file_group(const std::vector<std::string>& files,
   g_total_messages.store(0);
   g_active_symbols.store(0);
 
-  auto packet_callback = [](const uint8_t *data, size_t length,
-                            uint64_t, const xdp::NetworkPacketInfo &info) {
-    g_total_packets.fetch_add(1, std::memory_order_relaxed);
-
-    if (length < xdp::PACKET_HEADER_SIZE) return;
-
-    xdp::PacketHeader pkt_header;
-    if (!xdp::parse_packet_header(data, length, pkt_header)) return;
-
-    size_t offset = xdp::PACKET_HEADER_SIZE;
-    for (uint8_t i = 0; i < pkt_header.num_messages && offset < length; i++) {
-      if (offset + xdp::MESSAGE_HEADER_SIZE > length) break;
-      uint16_t msg_size = xdp::read_le16(data + offset);
-      if (msg_size < xdp::MESSAGE_HEADER_SIZE || offset + msg_size > length) break;
-      uint16_t msg_type = xdp::read_le16(data + offset + 2);
-      process_xdp_message(data + offset, msg_size, msg_type, info.timestamp_ns);
-      offset += msg_size;
-    }
-  };
-
   // Process files sequentially within group (maintains state)
   size_t file_num = 0;
   for (const auto& pcap_file : files) {
@@ -1247,7 +565,7 @@ void process_file_group(const std::vector<std::string>& files,
     reader.preload();
 
     uint64_t pkts_before = g_total_packets.load();
-    reader.process_all(packet_callback);
+    reader.process_all(process_packet_callback);
     uint64_t pkts_in_file = g_total_packets.load() - pkts_before;
 
     // Progress every 10 files or at the end
@@ -1294,7 +612,7 @@ void process_file_group(const std::vector<std::string>& files,
   double toxicity_inv_var_avg = (symbols_with_inv_data > 0) ? toxicity_inv_variance_sum / symbols_with_inv_data : 0.0;
 
   // Aggregate online model learned weights across symbols (weighted by n_updates)
-  if (g_online_learning) {
+  if (g_config.online_learning) {
     double avg_weights[N_TOXICITY_FEATURES] = {};
     double avg_bias = 0.0;
     int total_updates = 0;
@@ -1329,6 +647,57 @@ void process_file_group(const std::vector<std::string>& files,
       std::cerr << std::fixed << std::setprecision(4) << avg_weights[i];
     }
     std::cerr << "], bias=" << std::fixed << std::setprecision(4) << avg_bias << "\n" << std::flush;
+
+    // Write structured JSON weights file if output directory specified
+    if (!g_config.output_dir.empty()) {
+      std::string json_path = g_config.output_dir + "/learned_weights_group_" + std::to_string(group_idx + 1) + ".json";
+      std::ofstream jout(json_path);
+      if (jout.is_open()) {
+        static const char* feature_names[N_TOXICITY_FEATURES] = {
+          "cancel_ratio", "ping_ratio", "odd_lot_ratio", "precision_ratio",
+          "resistance_ratio", "trade_flow_imbalance", "spread_change_rate", "price_momentum"
+        };
+        jout << "{\n";
+        jout << "  \"group\": " << (group_idx + 1) << ",\n";
+        jout << "  \"models_trained\": " << models_trained << ",\n";
+        jout << "  \"total_updates\": " << total_updates << ",\n";
+        jout << "  \"aggregate_weights\": {\n";
+        for (int i = 0; i < N_TOXICITY_FEATURES; i++) {
+          jout << "    \"" << feature_names[i] << "\": " << std::fixed << std::setprecision(6) << avg_weights[i];
+          if (i < N_TOXICITY_FEATURES - 1) jout << ",";
+          jout << "\n";
+        }
+        jout << "  },\n";
+        jout << "  \"aggregate_bias\": " << std::fixed << std::setprecision(6) << avg_bias << ",\n";
+        jout << "  \"per_symbol\": [\n";
+        bool first_symbol = true;
+        for (uint32_t idx = 0; idx < MAX_SYMBOLS; ++idx) {
+          if (!g_sims_initialized[idx].load(std::memory_order_relaxed)) continue;
+          PerSymbolSim* sim = g_sims_array[idx];
+          if (!sim || !sim->eligible_to_trade) continue;
+          const auto& model = sim->online_model;
+          if (model.n_updates <= model.warmup_fills) continue;
+          if (!first_symbol) jout << ",\n";
+          first_symbol = false;
+          jout << "    {\n";
+          jout << "      \"symbol_index\": " << idx << ",\n";
+          jout << "      \"ticker\": \"" << sim->cached_ticker << "\",\n";
+          jout << "      \"n_updates\": " << model.n_updates << ",\n";
+          jout << "      \"bias\": " << std::fixed << std::setprecision(6) << model.bias << ",\n";
+          jout << "      \"weights\": {";
+          for (int i = 0; i < N_TOXICITY_FEATURES; i++) {
+            if (i > 0) jout << ", ";
+            jout << "\"" << feature_names[i] << "\": " << std::fixed << std::setprecision(6) << model.weights[i];
+          }
+          jout << "}\n";
+          jout << "    }";
+        }
+        jout << "\n  ]\n";
+        jout << "}\n";
+        jout.close();
+        std::cerr << "[Group " << (group_idx+1) << "] Wrote learned weights JSON: " << json_path << "\n" << std::flush;
+      }
+    }
   }
 
   // Debug: confirm aggregation complete
@@ -1360,10 +729,10 @@ void process_file_group(const std::vector<std::string>& files,
   std::cerr << "[Group " << (group_idx+1) << "] Results written to shared memory\n" << std::flush;
 
   // Write per-fill and per-symbol CSV output if output directory specified
-  if (!g_output_dir.empty()) {
+  if (!g_config.output_dir.empty()) {
     // Per-fill CSV: toxicity score at fill time + realized adverse movement
     {
-      std::string fill_path = g_output_dir + "/fills_group_" + std::to_string(group_idx + 1) + ".csv";
+      std::string fill_path = g_config.output_dir + "/fills_group_" + std::to_string(group_idx + 1) + ".csv";
       std::ofstream fout(fill_path);
       if (fout.is_open()) {
         fout << "group,symbol,ticker,strategy,fill_time_ns,fill_price,fill_qty,is_buy,"
@@ -1402,7 +771,7 @@ void process_file_group(const std::vector<std::string>& files,
 
     // Per-symbol CSV: summary metrics per symbol
     {
-      std::string sym_path = g_output_dir + "/symbols_group_" + std::to_string(group_idx + 1) + ".csv";
+      std::string sym_path = g_config.output_dir + "/symbols_group_" + std::to_string(group_idx + 1) + ".csv";
       std::ofstream fout(sym_path);
       if (fout.is_open()) {
         fout << "group,symbol_index,ticker,baseline_pnl,toxicity_pnl,improvement,"
@@ -1452,48 +821,48 @@ int main(int argc, char *argv[]) {
     } else if ((arg == "-s" || arg == "--symbols") && i + 1 < argc) {
       symbol_file = argv[++i];
     } else if (arg == "--seed" && i + 1 < argc) {
-      g_exec.seed = std::stoull(argv[++i]);
+      g_config.exec.seed = std::stoull(argv[++i]);
     } else if (arg == "--latency-us" && i + 1 < argc) {
-      g_exec.latency_us_mean = std::stod(argv[++i]);
+      g_config.exec.latency_us_mean = std::stod(argv[++i]);
     } else if (arg == "--latency-jitter-us" && i + 1 < argc) {
-      g_exec.latency_us_jitter = std::stod(argv[++i]);
+      g_config.exec.latency_us_jitter = std::stod(argv[++i]);
     } else if (arg == "--queue-fraction" && i + 1 < argc) {
-      g_exec.queue_position_fraction = std::stod(argv[++i]);
+      g_config.exec.queue_position_fraction = std::stod(argv[++i]);
     } else if (arg == "--adverse-lookforward-us" && i + 1 < argc) {
-      g_exec.adverse_lookforward_us = std::stoull(argv[++i]);
+      g_config.exec.adverse_lookforward_us = std::stoull(argv[++i]);
     } else if (arg == "--adverse-multiplier" && i + 1 < argc) {
-      g_exec.adverse_selection_multiplier = std::stod(argv[++i]);
+      g_config.exec.adverse_selection_multiplier = std::stod(argv[++i]);
     } else if (arg == "--maker-rebate" && i + 1 < argc) {
-      g_exec.maker_rebate_per_share = std::stod(argv[++i]);
+      g_config.exec.maker_rebate_per_share = std::stod(argv[++i]);
     } else if (arg == "--max-position" && i + 1 < argc) {
-      g_exec.max_position_per_symbol = std::stod(argv[++i]);
+      g_config.exec.max_position_per_symbol = std::stod(argv[++i]);
     } else if (arg == "--max-loss" && i + 1 < argc) {
-      g_exec.max_daily_loss_per_symbol = std::stod(argv[++i]);
+      g_config.exec.max_daily_loss_per_symbol = std::stod(argv[++i]);
     } else if (arg == "--fill-mode" && i + 1 < argc) {
       const std::string mode = argv[++i];
       if (mode == "match") {
-        g_exec.fill_mode = ExecutionModelConfig::FillMode::Match;
+        g_config.exec.fill_mode = ExecutionModelConfig::FillMode::Match;
       } else {
-        g_exec.fill_mode = ExecutionModelConfig::FillMode::Cross;
+        g_config.exec.fill_mode = ExecutionModelConfig::FillMode::Cross;
       }
     } else if (arg == "--quote-interval-us" && i + 1 < argc) {
-      g_exec.quote_update_interval_us = std::stoull(argv[++i]);
+      g_config.exec.quote_update_interval_us = std::stoull(argv[++i]);
     } else if (arg == "--threads" && i + 1 < argc) {
       g_num_threads = std::stoull(argv[++i]);
     } else if (arg == "--files-per-group" && i + 1 < argc) {
       g_files_per_group = std::stoull(argv[++i]);
     } else if (arg == "--toxicity-threshold" && i + 1 < argc) {
-      g_toxicity_threshold = std::stod(argv[++i]);
+      g_config.toxicity_threshold = std::stod(argv[++i]);
     } else if (arg == "--toxicity-multiplier" && i + 1 < argc) {
-      g_toxicity_multiplier = std::stod(argv[++i]);
+      g_config.toxicity_multiplier = std::stod(argv[++i]);
     } else if (arg == "--output-dir" && i + 1 < argc) {
-      g_output_dir = argv[++i];
+      g_config.output_dir = argv[++i];
     } else if (arg == "--online-learning") {
-      g_online_learning = true;
+      g_config.online_learning = true;
     } else if (arg == "--learning-rate" && i + 1 < argc) {
-      g_learning_rate = std::stod(argv[++i]);
+      g_config.learning_rate = std::stod(argv[++i]);
     } else if (arg == "--warmup-fills" && i + 1 < argc) {
-      g_warmup_fills = std::stoi(argv[++i]);
+      g_config.warmup_fills = std::stoi(argv[++i]);
     } else if (arg == "--sequential") {
       g_use_parallel = false;
       g_use_hybrid = false;
@@ -1530,6 +899,39 @@ int main(int argc, char *argv[]) {
   } else if (g_use_parallel && pcap_files.size() > 1) {
     mode_str = "THREADED";
   }
+
+  // Log execution parameters for reproducibility
+  std::cerr << "=== Simulation Parameters ===\n"
+            << "Mode: " << mode_str << "\n"
+            << "PCAP files: " << pcap_files.size() << "\n"
+            << "Symbol file: " << symbol_file << "\n"
+            << "Seed: " << g_config.exec.seed << "\n"
+            << "Latency (us): " << g_config.exec.latency_us_mean
+            << " +/- " << g_config.exec.latency_us_jitter << "\n"
+            << "Queue fraction: " << g_config.exec.queue_position_fraction << "\n"
+            << "Queue variance: " << g_config.exec.queue_position_variance << "\n"
+            << "Adverse lookforward (us): " << g_config.exec.adverse_lookforward_us << "\n"
+            << "Adverse multiplier: " << g_config.exec.adverse_selection_multiplier << "\n"
+            << "Quote interval (us): " << g_config.exec.quote_update_interval_us << "\n"
+            << "Maker rebate: " << g_config.exec.maker_rebate_per_share << "\n"
+            << "Taker fee: " << g_config.exec.taker_fee_per_share << "\n"
+            << "Clearing fee: " << g_config.exec.clearing_fee_per_share << "\n"
+            << "Max position: " << g_config.exec.max_position_per_symbol << "\n"
+            << "Max loss: " << g_config.exec.max_daily_loss_per_symbol << "\n"
+            << "Fill mode: " << (g_config.exec.fill_mode == ExecutionModelConfig::FillMode::Cross ? "cross" : "match") << "\n"
+            << "Online learning: " << (g_config.online_learning ? "enabled" : "disabled") << "\n";
+  if (g_config.online_learning) {
+    std::cerr << "  Learning rate: " << g_config.learning_rate << "\n"
+              << "  Warmup fills: " << g_config.warmup_fills << "\n";
+  }
+  if (!g_filter_ticker.empty()) {
+    std::cerr << "Ticker filter: " << g_filter_ticker << "\n";
+  }
+  if (!g_config.output_dir.empty()) {
+    std::cerr << "Output dir: " << g_config.output_dir << "\n";
+  }
+  std::cerr << "Processes: " << num_procs << "\n"
+            << "============================\n" << std::flush;
 
   auto start_time = std::chrono::high_resolution_clock::now();
 
@@ -1754,35 +1156,6 @@ int main(int argc, char *argv[]) {
   (void)xdp::load_symbol_map(symbol_file);
   init_symbol_storage();
 
-  // Thread-safe packet processing callback
-  auto packet_callback = [](const uint8_t *data, size_t length,
-                            uint64_t, const xdp::NetworkPacketInfo &info) {
-    g_total_packets++;
-
-    if (length < xdp::PACKET_HEADER_SIZE)
-      return;
-
-    xdp::PacketHeader pkt_header;
-    if (!xdp::parse_packet_header(data, length, pkt_header))
-      return;
-
-    size_t offset = xdp::PACKET_HEADER_SIZE;
-
-    for (uint8_t i = 0; i < pkt_header.num_messages && offset < length; i++) {
-      if (offset + xdp::MESSAGE_HEADER_SIZE > length)
-        break;
-
-      uint16_t msg_size = xdp::read_le16(data + offset);
-      if (msg_size < xdp::MESSAGE_HEADER_SIZE || offset + msg_size > length)
-        break;
-
-      uint16_t msg_type = xdp::read_le16(data + offset + 2);
-      process_xdp_message(data + offset, msg_size, msg_type, info.timestamp_ns);
-
-      offset += msg_size;
-    }
-  };
-
   if (g_use_parallel && pcap_files.size() > 1) {
     // =====================================================================
     // PARALLEL PROCESSING MODE
@@ -1800,8 +1173,7 @@ int main(int argc, char *argv[]) {
       const std::string& pcap_file = pcap_files[file_idx];
 
       futures.push_back(pool.enqueue([&pcap_file, &progress_mutex,
-                                       total_files = pcap_files.size(),
-                                       &packet_callback]() -> size_t {
+                                       total_files = pcap_files.size()]() -> size_t {
         // Use memory-mapped reader for maximum throughput
         xdp::MmapPcapReader reader;
         if (!reader.open(pcap_file)) {
@@ -1814,7 +1186,7 @@ int main(int argc, char *argv[]) {
         // Pre-load file into memory
         reader.preload();
 
-        size_t file_packets = reader.process_all(packet_callback);
+        size_t file_packets = reader.process_all(process_packet_callback);
 
         // Report progress
         size_t completed = ++g_files_completed;
@@ -1870,7 +1242,7 @@ int main(int argc, char *argv[]) {
       reader.preload();
 
       uint64_t packets_before = g_total_packets.load();
-      reader.process_all(packet_callback);
+      reader.process_all(process_packet_callback);
       uint64_t file_packets = g_total_packets.load() - packets_before;
 
       std::cout << " " << file_packets << " packets";
@@ -1896,6 +1268,8 @@ int main(int argc, char *argv[]) {
   std::cout << "Files processed: " << pcap_files.size() << '\n';
 
   print_results();
+
+  cleanup_symbol_storage();
 
   return 0;
 }

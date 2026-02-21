@@ -35,6 +35,382 @@ bool passes_filter(const std::string &ticker, uint16_t msg_type) {
   return true;
 }
 
+// Print message-specific fields for a single message type.
+// The verbose flag controls whether to emit compact one-line or multi-line
+// labeled output.  The ticker and msg_num arguments are only used by simple
+// mode (verbose mode prints them in its own header section).
+void print_message_fields(const uint8_t *data, uint16_t msg_size,
+                          uint16_t msg_type, bool verbose,
+                          const std::string &ticker, uint32_t msg_num) {
+  switch (msg_type) {
+  case 100: { // Add Order
+    if (!verbose)
+      std::cout << ticker << " " << msg_num;
+    if (msg_size >= xdp::MessageSize::ADD_ORDER) {
+      uint64_t order_id = xdp::read_le64(data + 16);
+      uint32_t price = xdp::read_le32(data + 24);
+      uint32_t volume = xdp::read_le32(data + 28);
+      uint8_t side = data[32];
+      if (verbose) {
+        char firm_id[6] = {0};
+        std::memcpy(firm_id, data + 33, 5);
+        std::cout << "      OrderID: " << order_id << '\n';
+        std::cout << "      Price: $" << std::fixed << std::setprecision(4)
+                  << xdp::parse_price(price) << '\n';
+        std::cout << "      Volume: " << volume << '\n';
+        std::cout << "      Side: " << (side == 'B' ? "BUY" : "SELL") << '\n';
+        std::cout << "      FirmID: '" << firm_id << "'\n";
+      } else {
+        std::cout << " OrderID=" << order_id << " $" << std::fixed
+                  << std::setprecision(4) << xdp::parse_price(price) << " "
+                  << volume << " " << xdp::get_side_abbr(side);
+      }
+    }
+    break;
+  }
+
+  case 101: { // Modify Order
+    if (!verbose)
+      std::cout << ticker << " " << msg_num;
+    if (msg_size >= xdp::MessageSize::MODIFY_ORDER) {
+      uint64_t order_id = xdp::read_le64(data + 16);
+      uint32_t price = xdp::read_le32(data + 24);
+      uint32_t volume = xdp::read_le32(data + 28);
+      uint8_t position_change = data[32];
+      if (verbose) {
+        std::cout << "      OrderID: " << order_id << '\n';
+        std::cout << "      Price: $" << std::fixed << std::setprecision(4)
+                  << xdp::parse_price(price) << '\n';
+        std::cout << "      Volume: " << volume << '\n';
+        std::cout << "      Position Change: "
+                  << (position_change == 0 ? "Kept position" : "Lost position")
+                  << '\n';
+      } else {
+        std::cout << " OrderID=" << order_id << " $" << std::fixed
+                  << std::setprecision(4) << xdp::parse_price(price) << " "
+                  << volume
+                  << " Pos=" << (position_change == 0 ? "Kept" : "Lost");
+      }
+    }
+    break;
+  }
+
+  case 102: { // Delete Order
+    if (!verbose)
+      std::cout << ticker << " " << msg_num;
+    if (msg_size >= xdp::MessageSize::DELETE_ORDER) {
+      uint64_t order_id = xdp::read_le64(data + 16);
+      if (verbose) {
+        std::cout << "      OrderID: " << order_id << '\n';
+      } else {
+        std::cout << " OrderID=" << order_id;
+      }
+    }
+    break;
+  }
+
+  case 103: { // Execute Order
+    if (!verbose)
+      std::cout << ticker << " " << msg_num;
+    if (msg_size >= xdp::MessageSize::EXECUTE_ORDER) {
+      uint64_t order_id = xdp::read_le64(data + 16);
+      uint32_t trade_id = xdp::read_le32(data + 24);
+      uint32_t price = xdp::read_le32(data + 28);
+      uint32_t volume = xdp::read_le32(data + 32);
+      uint8_t printable_flag = data[36];
+      if (verbose) {
+        std::cout << "      OrderID: " << order_id << '\n';
+        std::cout << "      TradeID: " << trade_id << '\n';
+        std::cout << "      Price: $" << std::fixed << std::setprecision(4)
+                  << xdp::parse_price(price) << '\n';
+        std::cout << "      Volume: " << volume << '\n';
+        std::cout << "      Printable Flag: "
+                  << (printable_flag == 1 ? "Printed to SIP"
+                                          : "Not Printed to SIP")
+                  << '\n';
+      } else {
+        std::cout << " OrderID=" << order_id << " TradeID=" << trade_id << " $"
+                  << std::fixed << std::setprecision(4)
+                  << xdp::parse_price(price) << " Qty=" << volume;
+        if (printable_flag == 0) {
+          std::cout << " (NotPrinted)";
+        }
+      }
+    }
+    break;
+  }
+
+  case 104: { // Replace Order
+    if (!verbose)
+      std::cout << ticker << " " << msg_num;
+    if (msg_size >= xdp::MessageSize::REPLACE_ORDER) {
+      uint64_t order_id = xdp::read_le64(data + 16);
+      uint64_t new_order_id = xdp::read_le64(data + 24);
+      uint32_t price = xdp::read_le32(data + 32);
+      uint32_t volume = xdp::read_le32(data + 36);
+      if (verbose) {
+        std::cout << "      Old OrderID: " << order_id << '\n';
+        std::cout << "      New OrderID: " << new_order_id << '\n';
+        std::cout << "      Price: $" << std::fixed << std::setprecision(4)
+                  << xdp::parse_price(price) << '\n';
+        std::cout << "      Volume: " << volume << '\n';
+      } else {
+        std::cout << " OldOrderID=" << order_id
+                  << " NewOrderID=" << new_order_id << " $" << std::fixed
+                  << std::setprecision(4) << xdp::parse_price(price) << " "
+                  << volume;
+      }
+    }
+    break;
+  }
+
+  case 105: { // Imbalance Message
+    if (!verbose)
+      std::cout << ticker << " " << msg_num;
+    if (msg_size >= xdp::MessageSize::IMBALANCE) {
+      uint32_t reference_price = xdp::read_le32(data + 16);
+      uint32_t paired_qty = xdp::read_le32(data + 20);
+      uint32_t imbalance_qty = xdp::read_le32(data + 24);
+      uint8_t imbalance_side = data[28];
+      uint32_t indicative_match_price = xdp::read_le32(data + 38);
+      if (verbose) {
+        std::cout << "      Reference Price: $" << std::fixed
+                  << std::setprecision(4) << xdp::parse_price(reference_price)
+                  << '\n';
+        std::cout << "      Paired Quantity: " << paired_qty << '\n';
+        std::cout << "      Imbalance Quantity: " << imbalance_qty << '\n';
+        std::cout << "      Imbalance Side: "
+                  << (imbalance_side == 'B' ? "BUY" : "SELL") << '\n';
+        std::cout << "      Indicative Match Price: $" << std::fixed
+                  << std::setprecision(4)
+                  << xdp::parse_price(indicative_match_price) << '\n';
+      } else {
+        uint8_t unpaired_side = data[71];
+        uint8_t significant_imbalance = data[72];
+        std::cout << " RefPrice=$" << std::fixed << std::setprecision(4)
+                  << xdp::parse_price(reference_price)
+                  << " Paired=" << paired_qty
+                  << " Imbalance=" << imbalance_qty
+                  << " Side=" << static_cast<char>(imbalance_side)
+                  << " IndicativeMatch=$"
+                  << xdp::parse_price(indicative_match_price);
+        if (unpaired_side != ' ') {
+          std::cout << " UnpairedSide=" << static_cast<char>(unpaired_side);
+        }
+        if (significant_imbalance == 'Y') {
+          std::cout << " SignificantImbalance=Y";
+        }
+      }
+    }
+    break;
+  }
+
+  case 106: { // Add Order Refresh
+    if (!verbose)
+      std::cout << ticker << " " << msg_num;
+    if (msg_size >= xdp::MessageSize::ADD_ORDER_REFRESH) {
+      uint64_t order_id = xdp::read_le64(data + 20);
+      uint32_t price = xdp::read_le32(data + 28);
+      uint32_t volume = xdp::read_le32(data + 32);
+      uint8_t side = data[36];
+      if (verbose) {
+        char firm_id[6] = {0};
+        std::memcpy(firm_id, data + 37, 5);
+        std::cout << "      OrderID: " << order_id << '\n';
+        std::cout << "      Price: $" << std::fixed << std::setprecision(4)
+                  << xdp::parse_price(price) << '\n';
+        std::cout << "      Volume: " << volume << '\n';
+        std::cout << "      Side: " << (side == 'B' ? "BUY" : "SELL") << '\n';
+        std::cout << "      FirmID: '" << firm_id << "'\n";
+      } else {
+        std::cout << " OrderID=" << order_id << " $" << std::fixed
+                  << std::setprecision(4) << xdp::parse_price(price) << " "
+                  << volume << " " << xdp::get_side_abbr(side);
+      }
+    }
+    break;
+  }
+
+  case 110: { // Non-Displayed Trade
+    if (!verbose)
+      std::cout << ticker << " " << msg_num;
+    if (msg_size >= xdp::MessageSize::NON_DISPLAYED_TRADE) {
+      uint64_t trade_id = xdp::read_le64(data + 16);
+      uint32_t price = xdp::read_le32(data + 24);
+      uint32_t volume = xdp::read_le32(data + 28);
+      if (verbose) {
+        std::cout << "      TradeID: " << trade_id << '\n';
+        std::cout << "      Price: $" << std::fixed << std::setprecision(4)
+                  << xdp::parse_price(price) << '\n';
+        std::cout << "      Volume: " << volume << '\n';
+      } else {
+        std::cout << " TradeID=" << trade_id << " $" << std::fixed
+                  << std::setprecision(4) << xdp::parse_price(price)
+                  << " Qty=" << volume;
+      }
+    }
+    break;
+  }
+
+  case 111: { // Cross Trade
+    if (!verbose)
+      std::cout << ticker << " " << msg_num;
+    if (msg_size >= xdp::MessageSize::CROSS_TRADE) {
+      uint64_t cross_id = xdp::read_le64(data + 16);
+      uint32_t price = xdp::read_le32(data + 24);
+      uint32_t volume = xdp::read_le32(data + 28);
+      uint32_t cross_type = xdp::read_le32(data + 32);
+      if (verbose) {
+        std::cout << "      CrossID: " << cross_id << '\n';
+        std::cout << "      Price: $" << std::fixed << std::setprecision(4)
+                  << xdp::parse_price(price) << '\n';
+        std::cout << "      Volume: " << volume << '\n';
+        std::cout << "      Cross Type: " << cross_type << '\n';
+      } else {
+        std::cout << " CrossID=" << cross_id << " $" << std::fixed
+                  << std::setprecision(4) << xdp::parse_price(price)
+                  << " Qty=" << volume << " Type=" << cross_type;
+      }
+    }
+    break;
+  }
+
+  case 112: { // Trade Cancel
+    if (!verbose)
+      std::cout << ticker << " " << msg_num;
+    if (msg_size >= xdp::MessageSize::TRADE_CANCEL) {
+      uint64_t trade_id = xdp::read_le64(data + 16);
+      uint32_t price = xdp::read_le32(data + 24);
+      uint32_t volume = xdp::read_le32(data + 28);
+      if (verbose) {
+        std::cout << "      TradeID: " << trade_id << '\n';
+        std::cout << "      Price: $" << std::fixed << std::setprecision(4)
+                  << xdp::parse_price(price) << '\n';
+        std::cout << "      Volume: " << volume << '\n';
+      } else {
+        std::cout << " TradeID=" << trade_id << " $" << std::fixed
+                  << std::setprecision(4) << xdp::parse_price(price)
+                  << " Qty=" << volume;
+      }
+    }
+    break;
+  }
+
+  case 113: { // Cross Correction
+    if (!verbose)
+      std::cout << ticker << " " << msg_num;
+    if (msg_size >= xdp::MessageSize::CROSS_CORRECTION) {
+      uint64_t cross_id = xdp::read_le64(data + 16);
+      uint32_t price = xdp::read_le32(data + 24);
+      uint32_t volume = xdp::read_le32(data + 28);
+      uint32_t cross_type = xdp::read_le32(data + 32);
+      if (verbose) {
+        std::cout << "      CrossID: " << cross_id << '\n';
+        std::cout << "      Price: $" << std::fixed << std::setprecision(4)
+                  << xdp::parse_price(price) << '\n';
+        std::cout << "      Volume: " << volume << '\n';
+        std::cout << "      Cross Type: " << cross_type << '\n';
+      } else {
+        std::cout << " CrossID=" << cross_id << " $" << std::fixed
+                  << std::setprecision(4) << xdp::parse_price(price)
+                  << " Qty=" << volume << " Type=" << cross_type;
+      }
+    }
+    break;
+  }
+
+  case 114: { // Retail Price Improvement
+    if (!verbose)
+      std::cout << ticker << " " << msg_num;
+    if (msg_size >= xdp::MessageSize::RETAIL_PRICE_IMPROVEMENT) {
+      uint8_t rpi_indicator = data[16];
+      if (verbose) {
+        std::cout << "      RPI Indicator: ";
+        switch (rpi_indicator) {
+        case ' ':
+          std::cout << "' ' (No retail interest)\n";
+          break;
+        case 'A':
+          std::cout << "'A' (Retail interest on bid side)\n";
+          break;
+        case 'B':
+          std::cout << "'B' (Retail interest on offer side)\n";
+          break;
+        case 'C':
+          std::cout << "'C' (Retail interest on both sides)\n";
+          break;
+        default:
+          std::cout << "'" << static_cast<char>(rpi_indicator)
+                    << "' (Unknown)\n";
+          break;
+        }
+      } else {
+        std::cout << " RPI=";
+        switch (rpi_indicator) {
+        case ' ':
+          std::cout << "None";
+          break;
+        case 'A':
+          std::cout << "Bid";
+          break;
+        case 'B':
+          std::cout << "Offer";
+          break;
+        case 'C':
+          std::cout << "Both";
+          break;
+        default:
+          std::cout << "'" << static_cast<char>(rpi_indicator) << "'";
+          break;
+        }
+      }
+    }
+    break;
+  }
+
+  case 223: { // Stock Summary
+    if (!verbose)
+      std::cout << ticker << " " << msg_num;
+    if (msg_size >= xdp::MessageSize::STOCK_SUMMARY) {
+      uint32_t high_price = xdp::read_le32(data + 16);
+      uint32_t low_price = xdp::read_le32(data + 20);
+      uint32_t open_price = xdp::read_le32(data + 24);
+      uint32_t close_price = xdp::read_le32(data + 28);
+      uint32_t total_volume = xdp::read_le32(data + 32);
+      if (verbose) {
+        std::cout << "      High Price: $" << std::fixed
+                  << std::setprecision(4) << xdp::parse_price(high_price)
+                  << '\n';
+        std::cout << "      Low Price: $" << xdp::parse_price(low_price)
+                  << '\n';
+        std::cout << "      Open Price: $" << xdp::parse_price(open_price)
+                  << '\n';
+        std::cout << "      Close Price: $" << xdp::parse_price(close_price)
+                  << '\n';
+        std::cout << "      Total Volume: " << total_volume << '\n';
+      } else {
+        std::cout << " High=$" << std::fixed << std::setprecision(4)
+                  << xdp::parse_price(high_price)
+                  << " Low=$" << xdp::parse_price(low_price)
+                  << " Open=$" << xdp::parse_price(open_price)
+                  << " Close=$" << xdp::parse_price(close_price)
+                  << " Volume=" << total_volume;
+      }
+    }
+    break;
+  }
+
+  default:
+    if (verbose) {
+      std::cout << "      Unknown message type, size: " << msg_size
+                << " bytes\n";
+    } else {
+      std::cout << ticker << " Type=" << msg_type << " Size=" << msg_size;
+    }
+    break;
+  }
+}
+
 // Parse and output message in simplified format
 void parse_message_simple(const uint8_t *data, size_t max_len,
                           uint32_t packet_send_time,
@@ -83,219 +459,7 @@ void parse_message_simple(const uint8_t *data, size_t max_len,
     msg_num = ++g_symbol_msg_counters[symbol_index];
   }
 
-  // Parse message-specific fields
-  switch (msg_type) {
-  case 100: { // Add Order
-    std::cout << ticker << " " << msg_num;
-    if (msg_size >= xdp::MessageSize::ADD_ORDER) {
-      uint64_t order_id = xdp::read_le64(data + 16);
-      uint32_t price = xdp::read_le32(data + 24);
-      uint32_t volume = xdp::read_le32(data + 28);
-      uint8_t side = data[32];
-      std::cout << " OrderID=" << order_id << " $" << std::fixed
-                << std::setprecision(4) << xdp::parse_price(price) << " "
-                << volume << " " << xdp::get_side_abbr(side);
-    }
-    break;
-  }
-
-  case 101: { // Modify Order
-    std::cout << ticker << " " << msg_num;
-    if (msg_size >= xdp::MessageSize::MODIFY_ORDER) {
-      uint64_t order_id = xdp::read_le64(data + 16);
-      uint32_t price = xdp::read_le32(data + 24);
-      uint32_t volume = xdp::read_le32(data + 28);
-      uint8_t position_change = data[32];
-      std::cout << " OrderID=" << order_id << " $" << std::fixed
-                << std::setprecision(4) << xdp::parse_price(price) << " "
-                << volume << " Pos=" << (position_change == 0 ? "Kept" : "Lost");
-    }
-    break;
-  }
-
-  case 102: { // Delete Order
-    std::cout << ticker << " " << msg_num;
-    if (msg_size >= xdp::MessageSize::DELETE_ORDER) {
-      uint64_t order_id = xdp::read_le64(data + 16);
-      std::cout << " OrderID=" << order_id;
-    }
-    break;
-  }
-
-  case 103: { // Execute Order
-    std::cout << ticker << " " << msg_num;
-    if (msg_size >= xdp::MessageSize::EXECUTE_ORDER) {
-      uint64_t order_id = xdp::read_le64(data + 16);
-      uint32_t trade_id = xdp::read_le32(data + 24);
-      uint32_t price = xdp::read_le32(data + 28);
-      uint32_t volume = xdp::read_le32(data + 32);
-      uint8_t printable_flag = data[36];
-      std::cout << " OrderID=" << order_id << " TradeID=" << trade_id << " $"
-                << std::fixed << std::setprecision(4) << xdp::parse_price(price)
-                << " Qty=" << volume;
-      if (printable_flag == 0) {
-        std::cout << " (NotPrinted)";
-      }
-    }
-    break;
-  }
-
-  case 104: { // Replace Order
-    std::cout << ticker << " " << msg_num;
-    if (msg_size >= xdp::MessageSize::REPLACE_ORDER) {
-      uint64_t order_id = xdp::read_le64(data + 16);
-      uint64_t new_order_id = xdp::read_le64(data + 24);
-      uint32_t price = xdp::read_le32(data + 32);
-      uint32_t volume = xdp::read_le32(data + 36);
-      std::cout << " OldOrderID=" << order_id << " NewOrderID=" << new_order_id
-                << " $" << std::fixed << std::setprecision(4)
-                << xdp::parse_price(price) << " " << volume;
-    }
-    break;
-  }
-
-  case 105: { // Imbalance Message
-    std::cout << ticker << " " << msg_num;
-    if (msg_size >= xdp::MessageSize::IMBALANCE) {
-      uint32_t reference_price = xdp::read_le32(data + 16);
-      uint32_t paired_qty = xdp::read_le32(data + 20);
-      uint32_t imbalance_qty = xdp::read_le32(data + 24);
-      uint8_t imbalance_side = data[28];
-      uint32_t indicative_match_price = xdp::read_le32(data + 38);
-      uint8_t unpaired_side = data[71];
-      uint8_t significant_imbalance = data[72];
-      std::cout << " RefPrice=$" << std::fixed << std::setprecision(4)
-                << xdp::parse_price(reference_price) << " Paired=" << paired_qty
-                << " Imbalance=" << imbalance_qty
-                << " Side=" << static_cast<char>(imbalance_side)
-                << " IndicativeMatch=$"
-                << xdp::parse_price(indicative_match_price);
-      if (unpaired_side != ' ') {
-        std::cout << " UnpairedSide=" << static_cast<char>(unpaired_side);
-      }
-      if (significant_imbalance == 'Y') {
-        std::cout << " SignificantImbalance=Y";
-      }
-    }
-    break;
-  }
-
-  case 106: { // Add Order Refresh
-    std::cout << ticker << " " << msg_num;
-    if (msg_size >= xdp::MessageSize::ADD_ORDER_REFRESH) {
-      uint64_t order_id = xdp::read_le64(data + 20);
-      uint32_t price = xdp::read_le32(data + 28);
-      uint32_t volume = xdp::read_le32(data + 32);
-      uint8_t side = data[36];
-      std::cout << " OrderID=" << order_id << " $" << std::fixed
-                << std::setprecision(4) << xdp::parse_price(price) << " "
-                << volume << " " << xdp::get_side_abbr(side);
-    }
-    break;
-  }
-
-  case 110: { // Non-Displayed Trade
-    std::cout << ticker << " " << msg_num;
-    if (msg_size >= xdp::MessageSize::NON_DISPLAYED_TRADE) {
-      uint64_t trade_id = xdp::read_le64(data + 16);
-      uint32_t price = xdp::read_le32(data + 24);
-      uint32_t volume = xdp::read_le32(data + 28);
-      std::cout << " TradeID=" << trade_id << " $" << std::fixed
-                << std::setprecision(4) << xdp::parse_price(price)
-                << " Qty=" << volume;
-    }
-    break;
-  }
-
-  case 111: { // Cross Trade
-    std::cout << ticker << " " << msg_num;
-    if (msg_size >= xdp::MessageSize::CROSS_TRADE) {
-      uint64_t cross_id = xdp::read_le64(data + 16);
-      uint32_t price = xdp::read_le32(data + 24);
-      uint32_t volume = xdp::read_le32(data + 28);
-      uint32_t cross_type = xdp::read_le32(data + 32);
-      std::cout << " CrossID=" << cross_id << " $" << std::fixed
-                << std::setprecision(4) << xdp::parse_price(price)
-                << " Qty=" << volume << " Type=" << cross_type;
-    }
-    break;
-  }
-
-  case 112: { // Trade Cancel
-    std::cout << ticker << " " << msg_num;
-    if (msg_size >= xdp::MessageSize::TRADE_CANCEL) {
-      uint64_t trade_id = xdp::read_le64(data + 16);
-      uint32_t price = xdp::read_le32(data + 24);
-      uint32_t volume = xdp::read_le32(data + 28);
-      std::cout << " TradeID=" << trade_id << " $" << std::fixed
-                << std::setprecision(4) << xdp::parse_price(price)
-                << " Qty=" << volume;
-    }
-    break;
-  }
-
-  case 113: { // Cross Correction
-    std::cout << ticker << " " << msg_num;
-    if (msg_size >= xdp::MessageSize::CROSS_CORRECTION) {
-      uint64_t cross_id = xdp::read_le64(data + 16);
-      uint32_t price = xdp::read_le32(data + 24);
-      uint32_t volume = xdp::read_le32(data + 28);
-      uint32_t cross_type = xdp::read_le32(data + 32);
-      std::cout << " CrossID=" << cross_id << " $" << std::fixed
-                << std::setprecision(4) << xdp::parse_price(price)
-                << " Qty=" << volume << " Type=" << cross_type;
-    }
-    break;
-  }
-
-  case 114: { // Retail Price Improvement
-    std::cout << ticker << " " << msg_num;
-    if (msg_size >= xdp::MessageSize::RETAIL_PRICE_IMPROVEMENT) {
-      uint8_t rpi_indicator = data[16];
-      std::cout << " RPI=";
-      switch (rpi_indicator) {
-      case ' ':
-        std::cout << "None";
-        break;
-      case 'A':
-        std::cout << "Bid";
-        break;
-      case 'B':
-        std::cout << "Offer";
-        break;
-      case 'C':
-        std::cout << "Both";
-        break;
-      default:
-        std::cout << "'" << static_cast<char>(rpi_indicator) << "'";
-        break;
-      }
-    }
-    break;
-  }
-
-  case 223: { // Stock Summary
-    std::cout << ticker << " " << msg_num;
-    if (msg_size >= xdp::MessageSize::STOCK_SUMMARY) {
-      uint32_t high_price = xdp::read_le32(data + 16);
-      uint32_t low_price = xdp::read_le32(data + 20);
-      uint32_t open_price = xdp::read_le32(data + 24);
-      uint32_t close_price = xdp::read_le32(data + 28);
-      uint32_t total_volume = xdp::read_le32(data + 32);
-      std::cout << " High=$" << std::fixed << std::setprecision(4)
-                << xdp::parse_price(high_price)
-                << " Low=$" << xdp::parse_price(low_price)
-                << " Open=$" << xdp::parse_price(open_price)
-                << " Close=$" << xdp::parse_price(close_price)
-                << " Volume=" << total_volume;
-    }
-    break;
-  }
-
-  default:
-    std::cout << ticker << " Type=" << msg_type << " Size=" << msg_size;
-    break;
-  }
+  print_message_fields(data, msg_size, msg_type, false, ticker, msg_num);
   std::cout << '\n';
 }
 
@@ -354,240 +518,7 @@ void parse_message_verbose(const uint8_t *data, size_t max_len, int msg_num) {
     std::cout << "      SymbolSeqNum: " << symbol_seq << '\n';
   }
 
-  // Parse message-specific fields
-  switch (msg_type) {
-  case 100: { // Add Order
-    if (msg_size >= xdp::MessageSize::ADD_ORDER) {
-      uint64_t order_id = xdp::read_le64(data + 16);
-      uint32_t price = xdp::read_le32(data + 24);
-      uint32_t volume = xdp::read_le32(data + 28);
-      uint8_t side = data[32];
-      char firm_id[6] = {0};
-      std::memcpy(firm_id, data + 33, 5);
-
-      std::cout << "      OrderID: " << order_id << '\n';
-      std::cout << "      Price: $" << std::fixed << std::setprecision(4)
-                << xdp::parse_price(price) << '\n';
-      std::cout << "      Volume: " << volume << '\n';
-      std::cout << "      Side: " << (side == 'B' ? "BUY" : "SELL") << '\n';
-      std::cout << "      FirmID: '" << firm_id << "'\n";
-    }
-    break;
-  }
-
-  case 101: { // Modify Order
-    if (msg_size >= xdp::MessageSize::MODIFY_ORDER) {
-      uint64_t order_id = xdp::read_le64(data + 16);
-      uint32_t price = xdp::read_le32(data + 24);
-      uint32_t volume = xdp::read_le32(data + 28);
-      uint8_t position_change = data[32];
-
-      std::cout << "      OrderID: " << order_id << '\n';
-      std::cout << "      Price: $" << std::fixed << std::setprecision(4)
-                << xdp::parse_price(price) << '\n';
-      std::cout << "      Volume: " << volume << '\n';
-      std::cout << "      Position Change: "
-                << (position_change == 0 ? "Kept position" : "Lost position")
-                << '\n';
-    }
-    break;
-  }
-
-  case 102: { // Delete Order
-    if (msg_size >= xdp::MessageSize::DELETE_ORDER) {
-      uint64_t order_id = xdp::read_le64(data + 16);
-      std::cout << "      OrderID: " << order_id << '\n';
-    }
-    break;
-  }
-
-  case 103: { // Execute Order
-    if (msg_size >= xdp::MessageSize::EXECUTE_ORDER) {
-      uint64_t order_id = xdp::read_le64(data + 16);
-      uint32_t trade_id = xdp::read_le32(data + 24);
-      uint32_t price = xdp::read_le32(data + 28);
-      uint32_t volume = xdp::read_le32(data + 32);
-      uint8_t printable_flag = data[36];
-
-      std::cout << "      OrderID: " << order_id << '\n';
-      std::cout << "      TradeID: " << trade_id << '\n';
-      std::cout << "      Price: $" << std::fixed << std::setprecision(4)
-                << xdp::parse_price(price) << '\n';
-      std::cout << "      Volume: " << volume << '\n';
-      std::cout << "      Printable Flag: "
-                << (printable_flag == 1 ? "Printed to SIP"
-                                        : "Not Printed to SIP")
-                << '\n';
-    }
-    break;
-  }
-
-  case 104: { // Replace Order
-    if (msg_size >= xdp::MessageSize::REPLACE_ORDER) {
-      uint64_t order_id = xdp::read_le64(data + 16);
-      uint64_t new_order_id = xdp::read_le64(data + 24);
-      uint32_t price = xdp::read_le32(data + 32);
-      uint32_t volume = xdp::read_le32(data + 36);
-
-      std::cout << "      Old OrderID: " << order_id << '\n';
-      std::cout << "      New OrderID: " << new_order_id << '\n';
-      std::cout << "      Price: $" << std::fixed << std::setprecision(4)
-                << xdp::parse_price(price) << '\n';
-      std::cout << "      Volume: " << volume << '\n';
-    }
-    break;
-  }
-
-  case 105: { // Imbalance Message
-    if (msg_size >= xdp::MessageSize::IMBALANCE) {
-      uint32_t reference_price = xdp::read_le32(data + 16);
-      uint32_t paired_qty = xdp::read_le32(data + 20);
-      uint32_t imbalance_qty = xdp::read_le32(data + 24);
-      uint8_t imbalance_side = data[28];
-      uint32_t indicative_match_price = xdp::read_le32(data + 38);
-
-      std::cout << "      Reference Price: $" << std::fixed
-                << std::setprecision(4) << xdp::parse_price(reference_price)
-                << '\n';
-      std::cout << "      Paired Quantity: " << paired_qty << '\n';
-      std::cout << "      Imbalance Quantity: " << imbalance_qty << '\n';
-      std::cout << "      Imbalance Side: "
-                << (imbalance_side == 'B' ? "BUY" : "SELL") << '\n';
-      std::cout << "      Indicative Match Price: $" << std::fixed
-                << std::setprecision(4)
-                << xdp::parse_price(indicative_match_price) << '\n';
-    }
-    break;
-  }
-
-  case 106: { // Add Order Refresh
-    if (msg_size >= xdp::MessageSize::ADD_ORDER_REFRESH) {
-      uint64_t order_id = xdp::read_le64(data + 20);
-      uint32_t price = xdp::read_le32(data + 28);
-      uint32_t volume = xdp::read_le32(data + 32);
-      uint8_t side = data[36];
-      char firm_id[6] = {0};
-      std::memcpy(firm_id, data + 37, 5);
-
-      std::cout << "      OrderID: " << order_id << '\n';
-      std::cout << "      Price: $" << std::fixed << std::setprecision(4)
-                << xdp::parse_price(price) << '\n';
-      std::cout << "      Volume: " << volume << '\n';
-      std::cout << "      Side: " << (side == 'B' ? "BUY" : "SELL") << '\n';
-      std::cout << "      FirmID: '" << firm_id << "'\n";
-    }
-    break;
-  }
-
-  case 110: { // Non-Displayed Trade
-    if (msg_size >= xdp::MessageSize::NON_DISPLAYED_TRADE) {
-      uint64_t trade_id = xdp::read_le64(data + 16);
-      uint32_t price = xdp::read_le32(data + 24);
-      uint32_t volume = xdp::read_le32(data + 28);
-
-      std::cout << "      TradeID: " << trade_id << '\n';
-      std::cout << "      Price: $" << std::fixed << std::setprecision(4)
-                << xdp::parse_price(price) << '\n';
-      std::cout << "      Volume: " << volume << '\n';
-    }
-    break;
-  }
-
-  case 111: { // Cross Trade
-    if (msg_size >= xdp::MessageSize::CROSS_TRADE) {
-      uint64_t cross_id = xdp::read_le64(data + 16);
-      uint32_t price = xdp::read_le32(data + 24);
-      uint32_t volume = xdp::read_le32(data + 28);
-      uint32_t cross_type = xdp::read_le32(data + 32);
-
-      std::cout << "      CrossID: " << cross_id << '\n';
-      std::cout << "      Price: $" << std::fixed << std::setprecision(4)
-                << xdp::parse_price(price) << '\n';
-      std::cout << "      Volume: " << volume << '\n';
-      std::cout << "      Cross Type: " << cross_type << '\n';
-    }
-    break;
-  }
-
-  case 112: { // Trade Cancel
-    if (msg_size >= xdp::MessageSize::TRADE_CANCEL) {
-      uint64_t trade_id = xdp::read_le64(data + 16);
-      uint32_t price = xdp::read_le32(data + 24);
-      uint32_t volume = xdp::read_le32(data + 28);
-
-      std::cout << "      TradeID: " << trade_id << '\n';
-      std::cout << "      Price: $" << std::fixed << std::setprecision(4)
-                << xdp::parse_price(price) << '\n';
-      std::cout << "      Volume: " << volume << '\n';
-    }
-    break;
-  }
-
-  case 113: { // Cross Correction
-    if (msg_size >= xdp::MessageSize::CROSS_CORRECTION) {
-      uint64_t cross_id = xdp::read_le64(data + 16);
-      uint32_t price = xdp::read_le32(data + 24);
-      uint32_t volume = xdp::read_le32(data + 28);
-      uint32_t cross_type = xdp::read_le32(data + 32);
-
-      std::cout << "      CrossID: " << cross_id << '\n';
-      std::cout << "      Price: $" << std::fixed << std::setprecision(4)
-                << xdp::parse_price(price) << '\n';
-      std::cout << "      Volume: " << volume << '\n';
-      std::cout << "      Cross Type: " << cross_type << '\n';
-    }
-    break;
-  }
-
-  case 114: { // Retail Price Improvement
-    if (msg_size >= xdp::MessageSize::RETAIL_PRICE_IMPROVEMENT) {
-      uint8_t rpi_indicator = data[16];
-      std::cout << "      RPI Indicator: ";
-      switch (rpi_indicator) {
-      case ' ':
-        std::cout << "' ' (No retail interest)\n";
-        break;
-      case 'A':
-        std::cout << "'A' (Retail interest on bid side)\n";
-        break;
-      case 'B':
-        std::cout << "'B' (Retail interest on offer side)\n";
-        break;
-      case 'C':
-        std::cout << "'C' (Retail interest on both sides)\n";
-        break;
-      default:
-        std::cout << "'" << static_cast<char>(rpi_indicator) << "' (Unknown)\n";
-        break;
-      }
-    }
-    break;
-  }
-
-  case 223: { // Stock Summary
-    if (msg_size >= xdp::MessageSize::STOCK_SUMMARY) {
-      uint32_t high_price = xdp::read_le32(data + 16);
-      uint32_t low_price = xdp::read_le32(data + 20);
-      uint32_t open_price = xdp::read_le32(data + 24);
-      uint32_t close_price = xdp::read_le32(data + 28);
-      uint32_t total_volume = xdp::read_le32(data + 32);
-
-      std::cout << "      High Price: $" << std::fixed << std::setprecision(4)
-                << xdp::parse_price(high_price) << '\n';
-      std::cout << "      Low Price: $" << xdp::parse_price(low_price) << '\n';
-      std::cout << "      Open Price: $" << xdp::parse_price(open_price)
-                << '\n';
-      std::cout << "      Close Price: $" << xdp::parse_price(close_price)
-                << '\n';
-      std::cout << "      Total Volume: " << total_volume << '\n';
-    }
-    break;
-  }
-
-  default:
-    std::cout << "      Unknown message type, size: " << msg_size << " bytes\n";
-    break;
-  }
+  print_message_fields(data, msg_size, msg_type, true, ticker, 0);
 }
 
 // Parse XDP packet in verbose mode

@@ -285,12 +285,4 @@ private:
   std::string error_;
 };
 
-// Batch packet structure for collecting packets before parallel processing
-struct BatchedPacket {
-  const uint8_t* payload;
-  size_t payload_len;
-  uint64_t timestamp_ns;
-  uint32_t symbol_index;  // Pre-extracted for sorting
-};
-
 } // namespace xdp

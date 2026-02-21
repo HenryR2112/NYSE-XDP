@@ -90,15 +90,56 @@ public:
     uint32_t total_ask_qty = 0;
     int bid_levels = 0;
     int ask_levels = 0;
-    double one_ms_toxicity = 0.0;
-    double ten_ms_toxicity = 0.0;
-    double hundred_ms_toxicity = 0.0;
-    double one_second_toxicity = 0.0;
-    double ten_seconds_toxicity = 0.0;
-    double hundred_seconds_toxicity = 0.0;
-    double one_minute_toxicity = 0.0;
-    double ten_minutes_toxicity = 0.0;
   };
+
+  // Lightweight snapshot for strategy quote updates - captures only
+  // what the market-making strategies need in a single lock acquisition.
+  struct BookSnapshot {
+    BookStats stats;
+    double last_traded_price = 0.0;
+    // Top N levels with toxicity scores (price descending for bids, ascending for asks)
+    static constexpr int MAX_LEVELS = 3;
+    struct Level {
+      double price = 0.0;
+      uint32_t qty = 0;
+      double toxicity_score = 0.0;
+    };
+    Level bid_levels[MAX_LEVELS] = {};
+    Level ask_levels[MAX_LEVELS] = {};
+    int num_bid_levels = 0;
+    int num_ask_levels = 0;
+  };
+
+  [[nodiscard]] BookSnapshot get_snapshot() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    BookSnapshot snap;
+    snap.stats = stats_;
+    snap.last_traded_price = last_traded_price_;
+
+    int i = 0;
+    for (auto it = bids_.begin(); it != bids_.end() && i < BookSnapshot::MAX_LEVELS; ++it, ++i) {
+      snap.bid_levels[i].price = it->first;
+      snap.bid_levels[i].qty = it->second;
+      auto tox_it = bid_toxicity_.find(it->first);
+      if (tox_it != bid_toxicity_.end()) {
+        snap.bid_levels[i].toxicity_score = tox_it->second.get_toxicity_score();
+      }
+    }
+    snap.num_bid_levels = i;
+
+    i = 0;
+    for (auto it = asks_.begin(); it != asks_.end() && i < BookSnapshot::MAX_LEVELS; ++it, ++i) {
+      snap.ask_levels[i].price = it->first;
+      snap.ask_levels[i].qty = it->second;
+      auto tox_it = ask_toxicity_.find(it->first);
+      if (tox_it != ask_toxicity_.end()) {
+        snap.ask_levels[i].toxicity_score = tox_it->second.get_toxicity_score();
+      }
+    }
+    snap.num_ask_levels = i;
+
+    return snap;
+  }
 
   OrderBook() = default;
 
@@ -111,6 +152,8 @@ public:
     ask_toxicity_.clear();
     last_traded_price_ = 0.0;
     last_traded_volume_ = 0;
+    total_bid_volume_ = 0;
+    total_ask_volume_ = 0;
     update_stats();
   }
 
@@ -119,9 +162,11 @@ public:
 
     if (side == 'B') {
       bids_[price] += volume;
+      total_bid_volume_ += volume;
       update_toxicity_on_add(bid_toxicity_[price], price, volume);
     } else {
       asks_[price] += volume;
+      total_ask_volume_ += volume;
       update_toxicity_on_add(ask_toxicity_[price], price, volume);
     }
 
@@ -139,13 +184,15 @@ public:
 
     Order &order = it->second;
 
-    // Remove from old price level
+    // Remove from old price level (remove_volume_from_* updates running totals)
     if (order.side == 'B') {
       remove_volume_from_bids(order.price, order.volume);
       bids_[new_price] += new_volume;
+      total_bid_volume_ += new_volume;
     } else {
       remove_volume_from_asks(order.price, order.volume);
       asks_[new_price] += new_volume;
+      total_ask_volume_ += new_volume;
     }
 
     // Update order
@@ -193,11 +240,13 @@ public:
       order.volume -= executed_qty;
       if (order.side == 'B') {
         bids_[order.price] -= executed_qty;
+        total_bid_volume_ -= executed_qty;
       } else {
         asks_[order.price] -= executed_qty;
+        total_ask_volume_ -= executed_qty;
       }
     } else {
-      // Full fill
+      // Full fill (remove_volume_from_* updates running totals)
       if (order.side == 'B') {
         remove_volume_from_bids(order.price, order.volume);
       } else {
@@ -244,6 +293,11 @@ public:
     // Clear toxicity metrics since we're restoring from checkpoint
     bid_toxicity_.clear();
     ask_toxicity_.clear();
+    // Recompute running totals from restored state
+    total_bid_volume_ = 0;
+    for (const auto& [p, v] : bids_) total_bid_volume_ += v;
+    total_ask_volume_ = 0;
+    for (const auto& [p, v] : asks_) total_ask_volume_ += v;
     update_stats();
   }
 
@@ -332,26 +386,34 @@ private:
 
   BookStats stats_;
 
-  // Helper to remove volume from bids
+  // Running totals for O(1) volume/level queries
+  uint32_t total_bid_volume_ = 0;
+  uint32_t total_ask_volume_ = 0;
+
+  // Helper to remove volume from bids (updates running totals)
   void remove_volume_from_bids(double price, uint32_t volume) {
     auto it = bids_.find(price);
     if (it != bids_.end()) {
       if (it->second <= volume) {
+        total_bid_volume_ -= it->second;
         bids_.erase(it);
       } else {
         it->second -= volume;
+        total_bid_volume_ -= volume;
       }
     }
   }
 
-  // Helper to remove volume from asks
+  // Helper to remove volume from asks (updates running totals)
   void remove_volume_from_asks(double price, uint32_t volume) {
     auto it = asks_.find(price);
     if (it != asks_.end()) {
       if (it->second <= volume) {
+        total_ask_volume_ -= it->second;
         asks_.erase(it);
       } else {
         it->second -= volume;
+        total_ask_volume_ -= volume;
       }
     }
   }
@@ -388,28 +450,15 @@ private:
   }
 
   void update_stats() {
+    // Level counts and volumes from running totals (O(1))
     stats_.bid_levels = static_cast<int>(bids_.size());
     stats_.ask_levels = static_cast<int>(asks_.size());
-    stats_.total_bid_qty = 0;
-    stats_.total_ask_qty = 0;
+    stats_.total_bid_qty = total_bid_volume_;
+    stats_.total_ask_qty = total_ask_volume_;
 
-    if (!bids_.empty()) {
-      stats_.best_bid = bids_.begin()->first;
-      for (const auto &pair : bids_) {
-        stats_.total_bid_qty += pair.second;
-      }
-    } else {
-      stats_.best_bid = 0.0;
-    }
-
-    if (!asks_.empty()) {
-      stats_.best_ask = asks_.begin()->first;
-      for (const auto &pair : asks_) {
-        stats_.total_ask_qty += pair.second;
-      }
-    } else {
-      stats_.best_ask = 0.0;
-    }
+    // Best bid/ask from map begin (O(1) for std::map)
+    stats_.best_bid = bids_.empty() ? 0.0 : bids_.begin()->first;
+    stats_.best_ask = asks_.empty() ? 0.0 : asks_.begin()->first;
 
     if (stats_.best_bid > 0 && stats_.best_ask > 0) {
       stats_.spread = stats_.best_ask - stats_.best_bid;

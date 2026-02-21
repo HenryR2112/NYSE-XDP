@@ -1,483 +1,244 @@
-# NYSE XDP Parser Architecture Documentation
-
-## Table of Contents
-1. [System Overview](#system-overview)
-2. [Architecture Components](#architecture-components)
-3. [Data Flow](#data-flow)
-4. [Threading Model](#threading-model)
-5. [Data Structures](#data-structures)
-6. [Message Processing Pipeline](#message-processing-pipeline)
-7. [Visualization System](#visualization-system)
-8. [Protocol Parsing](#protocol-parsing)
-9. [Performance Considerations](#performance-considerations)
+# Architecture Documentation
 
 ## System Overview
 
-The NYSE XDP Parser is a C++ application designed to parse, process, and visualize market data from NYSE Exchange Data Protocol (XDP) Integrated Feed. The system consists of three main executables:
+The NYSE-XDP platform is a C++17 market microstructure research system that processes NYSE XDP Integrated Feed PCAP data to simulate toxicity-screened market-making strategies. The system comprises four executables built from shared core libraries:
 
-1. **`reader`**: Command-line parser for analyzing PCAP files and outputting message data
-2. **`visualizer`**: Standalone GUI application with sample data for testing
-3. **`visualizer_pcap`**: Full-featured GUI application with PCAP file playback and real-time order book visualization
+| Target | Purpose | Primary source |
+|--------|---------|---------------|
+| `market_maker_sim` | Parallelized backtesting engine (primary) | `market_maker_sim.cpp`, `per_symbol_sim.cpp` |
+| `reader` | CLI XDP message parser | `reader.cpp` |
+| `visualizer` | Standalone ImGui order book viewer | `visualization.cpp` |
+| `visualizer_pcap` | PCAP-driven order book visualizer | `visualizer_pcap.cpp` |
 
-### High-Level Architecture
+### Simulation Module Structure
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Application Layer                         │
-├──────────────────┬──────────────────┬───────────────────────┤
-│   reader.cpp     │  visualizer.cpp  │  visualizer_pcap.cpp  │
-│  (CLI Parser)    │  (Standalone UI) │  (PCAP Playback UI)   │
-└────────┬─────────┴────────┬─────────┴───────────┬───────────┘
-         │                   │                     │
-         └───────────────────┼─────────────────────┘
-                             │
-         ┌───────────────────▼───────────────────────┐
-         │         Core Components                    │
-         ├────────────────────────────────────────────┤
-         │  • OrderBook (order_book.hpp)             │
-         │  • XDP Message Parser                     │
-         │  • PCAP Packet Handler                     │
-         │  • Symbol Mapping                         │
-         └────────────────────────────────────────────┘
-                             │
-         ┌───────────────────▼───────────────────────┐
-         │      External Libraries                    │
-         ├────────────────────────────────────────────┤
-         │  • libpcap (PCAP parsing)                 │
-         │  • SDL2 (Window management)                │
-         │  • OpenGL (Rendering)                      │
-         │  • Dear ImGui (UI framework)              │
-         └────────────────────────────────────────────┘
-```
+The simulator is decomposed into focused compilation units under `namespace mmsim`:
 
-## Architecture Components
+| File | Responsibility |
+|------|---------------|
+| `execution_model.hpp` | `ExecutionModelConfig` (HFT parameters) + `SimConfig` (runtime bundle) |
+| `feature_trackers.hpp` | Circular buffer trackers: `TradeFlowTracker`, `SpreadTracker`, `MomentumTracker` |
+| `sim_types.hpp` | Data types: `VirtualOrder`, `StrategyExecState`, `FillRecord`, `SymbolRiskState` |
+| `per_symbol_sim.hpp/cpp` | `PerSymbolSim` struct: shared order book, dual strategies, feature extraction, fill simulation |
+| `market_maker_sim.cpp` | Orchestration: `main()`, argument parsing, process management, XDP dispatch, results aggregation |
 
-### 1. Order Book Module (`order_book.hpp`)
-
-The `OrderBook` class is the core data structure that maintains the current state of the market.
-
-**Key Features:**
-- Thread-safe operations using mutex locks
-- Separate bid and ask price levels stored in ordered maps
-- Active order tracking with order ID lookup
-- Real-time statistics calculation (best bid/ask, spread, mid price)
-- Support for all order book operations: add, modify, delete, execute, replace
-
-**Data Structure:**
-```cpp
-class OrderBook {
-  std::map<double, uint32_t, std::greater<double>> bids;  // Price descending
-  std::map<double, uint32_t, std::less<double>> asks;     // Price ascending
-  std::unordered_map<uint64_t, Order> active_orders;       // Order ID -> Order
-  mutable std::mutex mtx;                                  // Thread safety
-};
-```
-
-**Operations:**
-- `add_order()`: Add new order to book
-- `modify_order()`: Update price/volume of existing order
-- `delete_order()`: Remove order from book
-- `execute_order()`: Process trade execution (partial or full fill)
-- `clear()`: Reset order book state
-- `get_stats()`: Get current market statistics (thread-safe snapshot)
-
-### 2. PCAP Processing Module
-
-Handles reading and parsing PCAP files containing XDP market data.
-
-**Components:**
-- **Packet Handler**: Extracts UDP payloads from Ethernet/IP/UDP headers
-- **XDP Parser**: Parses XDP packet headers and messages
-- **Message Router**: Routes messages to appropriate handlers based on message type
-
-**Packet Processing Flow:**
-```
-Ethernet Frame → IP Packet → UDP Datagram → XDP Packet → XDP Messages
-```
-
-### 3. Message Processing Module
-
-Processes individual XDP message types and updates the order book accordingly.
-
-**Supported Message Types:**
-- **100 (Add Order)**: New visible order added to book
-- **101 (Modify Order)**: Price/volume change with position tracking
-- **102 (Delete Order)**: Order removed from book
-- **103 (Execute Order)**: Order execution with price and quantity
-- **104 (Replace Order)**: Cancel/replace operation
-
-**Message Processing:**
-Each message type has a dedicated handler that:
-1. Validates message size and structure
-2. Extracts relevant fields (order ID, price, volume, side)
-3. Updates the order book state
-4. Maintains thread safety through mutex locks
-
-### 4. Symbol Mapping Module
-
-Maps numeric symbol indices to ticker symbols for human-readable output.
-
-**Implementation:**
-- Loads symbol mappings from text file
-- Uses `std::unordered_map<uint32_t, std::string>` for O(1) lookup
-- Supports filtering by ticker symbol
-- Fallback to numeric index if symbol not found
-
-### 5. Visualization Module
-
-Provides real-time graphical display of order book state using Dear ImGui.
-
-**Components:**
-- **OrderBookVisualizer Class**: Main visualization controller
-- **Rendering Pipeline**: SDL2 window + OpenGL context + ImGui rendering
-- **Playback Controls**: Interactive timeline and playback management
-- **Terminal-Style Display**: Traditional market data terminal layout
-
-## Data Flow
-
-### PCAP Visualizer Data Flow
+## High-Level Architecture
 
 ```
-┌──────────────┐
-│  PCAP File   │
-└──────┬───────┘
-       │
-       ▼
-┌─────────────────────┐
-│  PCAP Reader Thread │
-│  (pcap_reader_thread)│
-└──────┬──────────────┘
-       │
-       │ Extract UDP payloads
-       ▼
-┌─────────────────────┐
-│  Packet Events      │
-│  (packet_events[])  │
-└──────┬──────────────┘
-       │
-       │ Store for playback
-       ▼
-┌─────────────────────┐
-│  Playback Thread    │
-│  (playback_thread)  │
-└──────┬──────────────┘
-       │
-       │ Process packets sequentially
-       ▼
-┌─────────────────────┐
-│  XDP Message Parser │
-│  (parse_xdp_packet) │
-└──────┬──────────────┘
-       │
-       │ Extract messages
-       ▼
-┌─────────────────────┐
-│  Message Processor  │
-│  (process_xdp_msg)  │
-└──────┬──────────────┘
-       │
-       │ Update order book
-       ▼
-┌─────────────────────┐
-│  OrderBook          │
-│  (order_book)       │
-└──────┬──────────────┘
-       │
-       │ Read state
-       ▼
-┌─────────────────────┐
-│  Visualizer         │
-│  (render loop)      │
-└─────────────────────┘
+                     ┌──────────────────────────────────────────────┐
+                     │              market_maker_sim                 │
+                     │                                              │
+                     │  main() → fork() N child processes           │
+                     │  Each child:                                 │
+                     │    mmap PCAP files                           │
+                     │    → parse XDP messages                      │
+                     │    → per-symbol simulation (PerSymbolSim)    │
+                     │    → dual strategy comparison                │
+                     │    → write results to shared memory          │
+                     │  Parent: waitpid → aggregate → output        │
+                     └──────────────┬───────────────────────────────┘
+                                    │
+                     ┌──────────────▼───────────────────────────────┐
+                     │           Core Libraries                      │
+                     ├───────────────────────────────────────────────┤
+                     │  PerSymbolSim      (per_symbol_sim.hpp/cpp)   │
+                     │  SimConfig         (execution_model.hpp)      │
+                     │  FeatureTrackers   (feature_trackers.hpp)     │
+                     │  SimTypes          (sim_types.hpp)            │
+                     │  OrderBook         (order_book.hpp)           │
+                     │  MarketMakerStrategy (market_maker.hpp/cpp)   │
+                     │  OnlineToxicityModel (market_maker.hpp/cpp)   │
+                     │  MmapPcapReader    (mmap_pcap_reader.hpp)     │
+                     │  PcapReader        (pcap_reader.hpp)          │
+                     │  SymbolMap         (symbol_map.hpp/cpp)       │
+                     │  ThreadPool        (thread_pool.hpp)          │
+                     │  XDP types/utils   (xdp_types.hpp/utils.hpp) │
+                     └───────────────────────────────────────────────┘
 ```
 
-### Command-Line Reader Data Flow
+## Hybrid Multi-Process Architecture
+
+The simulator uses `fork(2)` with POSIX shared memory for maximum throughput on large datasets. This design eliminates all inter-process lock contention.
+
+### Process Lifecycle
 
 ```
-PCAP File → Packet Handler → XDP Parser → Message Parser → Console Output
+Parent process
+  │
+  ├─ Load symbol mappings (12,249 symbols)
+  ├─ Collect and sort PCAP files
+  ├─ Group files via greedy bin-packing (balanced by total file size)
+  ├─ Allocate shared memory (MAP_SHARED | MAP_ANONYMOUS)
+  │     └─ ProcessResults array[N] for inter-process aggregation
+  │
+  ├─ for each group i in [0, N):
+  │     fork()
+  │     └─ Child process i:
+  │          ├─ mmap each PCAP file (MADV_SEQUENTIAL)
+  │          ├─ Parse packets → XDP messages → symbol dispatch
+  │          ├─ Per-symbol: update order book, run strategies, record fills
+  │          ├─ Write per-group results to shared_memory[i]
+  │          ├─ Write CSV files if --output-dir specified
+  │          └─ _exit(0)  (avoids destructor overhead)
+  │
+  └─ Parent:
+       ├─ waitpid() for all children
+       ├─ Read shared_memory[0..N-1]
+       ├─ Aggregate portfolio-level statistics
+       └─ Print results to stdout
 ```
 
-## Threading Model
+### Why fork() Instead of Threads
 
-### PCAP Visualizer Threading
+- **Zero contention**: Each child has its own address space. No mutexes, atomics, or cache-line bouncing between groups.
+- **Fault isolation**: A segfault in one child doesn't affect others.
+- **Memory efficiency**: Copy-on-write pages mean forked children share read-only data (symbol maps, configuration).
+- **Simple aggregation**: Shared memory provides a clean interface for passing results back to the parent.
 
-The `visualizer_pcap` application uses a multi-threaded architecture:
+### File Grouping
 
-1. **Main Thread (UI Thread)**
-   - Handles SDL event processing
-   - Renders ImGui UI at 60 FPS
-   - Reads order book state (thread-safe snapshots)
-   - Processes user input (playback controls)
+Files are assigned to groups using greedy bin-packing sorted by file size (descending). This balances total bytes processed per group rather than file count, avoiding pathological load imbalance from unequal file sizes.
 
-2. **PCAP Reader Thread**
-   - Reads PCAP file sequentially
-   - Extracts XDP payloads from network packets
-   - Stores packet events in memory
-   - Runs until file is fully loaded
+## Per-Symbol Simulation (`PerSymbolSim`)
 
-3. **Playback Thread**
-   - Processes stored packet events sequentially
-   - Respects play/pause state
-   - Updates order book state
-   - Handles seek operations
-
-**Synchronization:**
-- `order_book_mutex`: Protects order book updates
-- `packet_events_mutex`: Protects packet event storage
-- `std::atomic<bool>`: Play/pause/stop flags
-- `std::atomic<size_t>`: Current packet index
-
-**Thread Safety:**
-- Order book operations are protected by mutex locks
-- Getters return copies (snapshots) to avoid race conditions
-- Atomic variables for state flags
-- Mutex-protected packet event storage
-
-## Data Structures
-
-### Order Structure
-
-```cpp
-struct Order {
-  uint64_t order_id;      // Unique order identifier
-  double price;           // Order price
-  uint32_t volume;        // Order quantity
-  char side;              // 'B' (buy) or 'S' (sell)
-  std::chrono::system_clock::time_point timestamp;
-};
-```
-
-### Packet Event Structure
-
-```cpp
-struct PacketEvent {
-  std::vector<uint8_t> data;                              // XDP payload
-  std::chrono::system_clock::time_point timestamp;        // Capture time
-};
-```
-
-### Book Statistics Structure
-
-```cpp
-struct BookStats {
-  double best_bid;        // Highest bid price
-  double best_ask;        // Lowest ask price
-  double spread;          // best_ask - best_bid
-  double mid_price;       // (best_bid + best_ask) / 2
-  uint32_t total_bid_qty; // Sum of all bid quantities
-  uint32_t total_ask_qty; // Sum of all ask quantities
-  int bid_levels;         // Number of bid price levels
-  int ask_levels;         // Number of ask price levels
-};
-```
-
-## Message Processing Pipeline
-
-### XDP Packet Structure
+Each symbol maintains independent simulation state:
 
 ```
-┌─────────────────────────────────────┐
-│      XDP Packet Header (16 bytes)   │
-├─────────────────────────────────────┤
-│ Packet Size (2) | Delivery Flag (1) │
-│ Message Count (1) | Sequence (4)     │
-│ Send Time Seconds (4)               │
-│ Send Time Nanoseconds (4)           │
-└─────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────┐
-│      XDP Message 1 (variable)      │
-├─────────────────────────────────────┤
-│ Message Size (2) | Message Type (2) │
-│ Message-specific data...            │
-└─────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────┐
-│      XDP Message 2 (variable)      │
-│      ... (up to Message Count)      │
-└─────────────────────────────────────┘
+PerSymbolSim
+  ├── OrderBook (order_book)             # Shared across both strategies
+  ├── MarketMakerStrategy (mm_baseline)  # No toxicity screening
+  ├── MarketMakerStrategy (mm_toxicity)  # With toxicity screening
+  ├── StrategyExecState (baseline/toxicity)
+  │     ├── VirtualOrder (bid/ask)       # Simulated resting orders
+  │     ├── pending_fills vector         # Fills awaiting adverse measurement
+  │     └── completed_fills vector       # Measured fills (preserved for CSV)
+  ├── Feature Trackers
+  │     ├── TradeFlowTracker             # Circular buffer, 100 trades
+  │     ├── SpreadTracker                # Circular buffer, 50 observations
+  │     └── MomentumTracker              # Circular buffer, 50 observations
+  ├── SymbolRiskState                    # Position limits, loss tracking
+  ├── OnlineToxicityModel (optional)     # SGD logistic model per symbol
+  └── RNG (deterministic, seeded per symbol)
 ```
 
-### Message Processing Steps
-
-1. **Packet Validation**
-   - Verify minimum packet size (16 bytes for header)
-   - Check message count field
-   - Validate sequence numbers
-
-2. **Message Extraction**
-   - Read message size and type from header
-   - Extract message payload
-   - Validate message size against remaining packet data
-
-3. **Symbol Resolution**
-   - Extract symbol index from message
-   - Lookup ticker symbol in mapping
-   - Apply symbol filter if specified
-
-4. **Order Book Update**
-   - Lock order book mutex
-   - Parse message-specific fields
-   - Execute appropriate order book operation
-   - Update statistics
-   - Release mutex
-
-## Visualization System
-
-### Rendering Architecture
+### Message Flow Per Symbol
 
 ```
-┌─────────────────────────────────────────┐
-│         SDL2 Window Manager             │
-│  • Window creation                      │
-│  • Event handling                       │
-│  • OpenGL context                       │
-└──────────────┬──────────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────────┐
-│         OpenGL Renderer                │
-│  • Context management                   │
-│  • Buffer swapping                      │
-└──────────────┬──────────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────────┐
-│         Dear ImGui                      │
-│  • Immediate mode GUI                   │
-│  • Widget rendering                     │
-│  • Input handling                       │
-└──────────────┬──────────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────────┐
-│    OrderBookVisualizer                  │
-│  • UI layout                            │
-│  • Order book rendering                 │
-│  • Playback controls                    │
-│  • Statistics display                   │
-└─────────────────────────────────────────┘
+XDP EXECUTE message arrives
+  │
+  ├─ Update order book (add_order / modify_order / delete_order / execute_order)
+  ├─ Check rate limit (10μs quote update interval)
+  │
+  ├─ For each strategy (baseline, toxicity):
+  │     ├─ Measure adverse selection on pending fills past lookforward window
+  │     ├─ Build feature vector (8 features from book + temporal trackers)
+  │     ├─ Compute toxicity score (SGD logistic model)
+  │     ├─ Compute expected PnL
+  │     ├─ Quote decision: post/update/cancel virtual orders
+  │     └─ Fill simulation: check latency, price, queue position
+  │
+  └─ Update feature trackers (trade flow, spread, momentum)
 ```
 
-### UI Components
+## Strategy Architecture (`MarketMakerStrategy`)
 
-1. **Playback Controls Panel**
-   - Play/Pause/Reset buttons
-   - Timeline slider for seeking
-   - Packet progress indicator
+The strategy class in `market_maker.hpp/cpp` encapsulates:
 
-2. **Order Book Display**
-   - Terminal-style bid/ask ladder
-   - Color-coded price levels (green bids, red asks)
-   - Real-time statistics header
-   - Level-by-level quantity display
+- **Spread calculation**: Base spread + toxicity adjustment + inventory skew
+- **Toxicity screening**: Expected PnL filter (binary quote/no-quote decision)
+- **Inventory management**: Quadratic skew function, position limits, loss stops
+- **Fill handling**: Weighted-average cost basis P&L tracking
+- **Online learning**: Optional SGD weight updates after observed adverse outcomes
 
-3. **Statistics Display**
-   - Best bid/ask prices
-   - Spread and mid price
-   - Total bid/ask quantities
-   - Level counts
+### Toxicity Model (`OnlineToxicityModel`)
 
-### Rendering Loop
+8-feature logistic regression with online SGD:
 
-```cpp
-while (running) {
-  1. Process SDL events
-  2. Start ImGui frame
-  3. Render playback controls
-  4. Get order book snapshot (thread-safe)
-  5. Render order book display
-  6. Render statistics
-  7. End ImGui frame
-  8. Swap OpenGL buffers
-  9. Sleep for ~16ms (60 FPS)
-}
+```
+Input: x = [cancel_ratio, ping_ratio, odd_lot_ratio, precision_ratio,
+            resistance_ratio, trade_flow, spread_change, momentum]
+
+During warmup (< 50 fills):
+  T = sigmoid(w_0 . clamp(x, 0, 1) + b)
+
+After warmup:
+  z = (x - running_mean) / running_stddev   (Welford's algorithm)
+  T = sigmoid(w . z + b)
+
+Update (after each fill's adverse outcome observed):
+  w <- w - eta_t * (T - y) * z    (binary cross-entropy gradient)
+  eta_t = eta_0 / (1 + t/1000)    (decaying learning rate)
+  w clipped to [-5, 5]
 ```
 
-## Protocol Parsing
+## Order Book (`OrderBook`)
+
+Thread-safe limit order book with per-level toxicity tracking:
+
+- **Price levels**: `std::map<double, uint32_t>` (descending for bids, ascending for asks)
+- **Order tracking**: `std::unordered_map<uint64_t, Order>` by order ID
+- **Toxicity metrics**: Per-level event counters (adds, cancels, volume, ping/odd-lot/precision/resistance counts)
+- **Thread safety**: Single `std::mutex` per book instance; getters return copies
+
+## I/O Layer
+
+### Memory-Mapped PCAP Reader (`MmapPcapReader`)
+
+```
+File → mmap(2) → madvise(MADV_SEQUENTIAL) → preload(touch pages) → iterate packets
+```
+
+- Zero-copy: packets are pointers into the mmap region
+- RAII: proper move semantics, munmap on destruction
+- Preload: optional page-touching to pre-fault into memory
 
 ### Network Stack Parsing
 
-The system parses the complete network stack:
+```
+Ethernet (14B) → IP (20B+) → UDP (8B) → XDP Packet Header (16B) → Messages
+```
 
-1. **Ethernet Header** (14 bytes)
-   - Extract EtherType
-   - Handle VLAN tags if present
+All XDP fields are little-endian. Prices are 32-bit integers / 10,000.
 
-2. **IP Header** (20+ bytes)
-   - Extract protocol field
-   - Extract source/destination IPs
-   - Calculate header length
+## Analysis Pipeline
 
-3. **UDP Header** (8 bytes)
-   - Extract destination port
-   - Extract payload length
-   - Calculate payload offset
+```
+market_maker_sim (C++)
+  │
+  ├─ stdout: per-group statistics (regex-parseable)
+  ├─ CSV: per-fill records (if --output-dir)
+  └─ CSV: per-symbol summaries (if --output-dir)
+        │
+        ▼
+Python scripts (stdlib only)
+  │
+  ├─ analyze_fills.py → advanced_analysis.json
+  │     (Spearman, bootstrap CIs, HAC, per-feature correlations)
+  │
+  ├─ test_hypotheses.py → hypothesis_test_results.json
+  │     (5 formal tests: Sharpe, adverse, variance, cross-sectional, MC)
+  │
+  └─ parameter_sensitivity.py → parameter_sensitivity.json
+        (One-at-a-time grid: phi, chi, mu_latency, kappa)
+              │
+              ▼
+        market_maker_manuscript.tex (LaTeX)
+```
 
-4. **XDP Payload**
-   - Parse XDP packet header
-   - Extract individual messages
-   - Process each message
+## Build System
 
-### Byte Order Handling
+CMake with four targets. The simulation target (`market_maker_sim`) links only against `libxdp_common` (symbol_map). Visualization targets additionally require SDL2, OpenGL, and ImGui.
 
-- **Network byte order**: Ethernet, IP, UDP headers (big-endian)
-- **XDP byte order**: All XDP fields (little-endian)
-- **Conversion**: Use `ntohs()`/`ntohl()` for network fields
-- **Direct read**: Use helper functions for XDP fields (`read_le16()`, `read_le32()`, `read_le64()`)
+## Performance Characteristics
 
-### Price Format
+On a 14-core Apple M3 Max with 64GB RAM and NVMe storage:
 
-- Prices stored as 32-bit integers
-- Divide by 10,000 to get dollar value
-- Example: `176540000` → `$17,654.0000`
-- Price scale may vary by symbol
-
-## Performance Considerations
-
-### Memory Management
-
-- **Packet Storage**: All packets loaded into memory for playback
-- **Order Book**: Efficient map-based storage (O(log n) operations)
-- **Symbol Mapping**: Hash map for O(1) lookups
-- **Memory Footprint**: Scales with PCAP file size and order book depth
-
-### Threading Performance
-
-- **Lock Contention**: Minimized by using atomic variables for flags
-- **Snapshot Pattern**: Order book getters return copies to avoid long-held locks
-- **Batch Processing**: Consider batching updates for high-frequency scenarios
-
-### Rendering Performance
-
-- **60 FPS Target**: 16ms frame budget
-- **ImGui Efficiency**: Immediate mode rendering is efficient for this use case
-- **Minimal Redraws**: Only update when order book changes
-
-### Optimization Opportunities
-
-1. **Lazy Statistics**: Calculate statistics only when requested
-2. **Update Batching**: Batch multiple order book updates per frame
-3. **Memory Pooling**: Reuse packet event structures
-4. **Compression**: Compress stored packet events for large files
-
-## Future Enhancements
-
-### Potential Improvements
-
-1. **Multi-Symbol Support**: Track multiple symbols simultaneously
-2. **Historical Playback**: Store order book snapshots at intervals
-3. **Export Functionality**: Export order book state to CSV/JSON
-4. **Advanced Filtering**: Filter by message type, price range, volume
-5. **Performance Metrics**: Display processing statistics (packets/sec, messages/sec)
-6. **Network Capture**: Support live network capture in addition to PCAP files
-7. **Order Book Replay**: Replay order book state from stored snapshots
-
-### Scalability Considerations
-
-- **Large PCAP Files**: Implement streaming processing for very large files
-- **High-Frequency Updates**: Optimize order book operations for high message rates
-- **Multiple Symbols**: Support per-symbol order books with efficient lookup
-- **Distributed Processing**: Consider parallel packet processing for large files
+| Metric | Value |
+|--------|-------|
+| Full-day processing time | ~217 seconds |
+| Message throughput (14 processes) | 70M+ messages/second |
+| Single-process throughput | 5-8M messages/second |
+| Memory per process | ~2GB peak (100K symbol slots) |
+| Dataset size | 74GB, 289M packets, 1.27B messages |
+| Scaling efficiency | Near-linear to 8 processes |

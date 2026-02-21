@@ -1,6 +1,7 @@
 #pragma once
 
 #include "order_book.hpp"
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -12,22 +13,22 @@
 static constexpr int N_TOXICITY_FEATURES = 8;
 
 struct ToxicityFeatureVector {
-  double features[N_TOXICITY_FEATURES] = {};
+  std::array<double, N_TOXICITY_FEATURES> features = {};
   // [0] cancel_ratio     [1] ping_ratio       [2] odd_lot_ratio
   // [3] precision_ratio   [4] resistance_ratio  [5] trade_flow_imbalance
   // [6] spread_change_rate [7] price_momentum
 };
 
 struct OnlineToxicityModel {
-  double weights[N_TOXICITY_FEATURES] = {0.4, 0.2, 0.15, 0.15, 0.1, 0.0, 0.0, 0.0};
+  std::array<double, N_TOXICITY_FEATURES> weights = {0.4, 0.2, 0.15, 0.15, 0.1, 0.0, 0.0, 0.0};
   double bias = 0.0;
   double base_learning_rate;
   int n_updates = 0;
   int warmup_fills;
 
   // Running z-score normalization (Welford's algorithm)
-  double feat_mean[N_TOXICITY_FEATURES] = {};
-  double feat_m2[N_TOXICITY_FEATURES] = {};
+  std::array<double, N_TOXICITY_FEATURES> feat_mean = {};
+  std::array<double, N_TOXICITY_FEATURES> feat_m2 = {};
   int feat_count = 0;
 
   explicit OnlineToxicityModel(double lr = 0.01, int warmup = 50)
@@ -81,7 +82,7 @@ public:
   MarketMakerStrategy(const MarketMakerStrategy &) = delete;
   MarketMakerStrategy &operator=(const MarketMakerStrategy &) = delete;
 
-  // Update market data and recalculate quotes
+  // Update market data and recalculate quotes (single lock acquisition via snapshot)
   void update_market_data();
 
   // Get current quotes (thread-safe)
@@ -112,7 +113,6 @@ public:
   void reset();
 
   // Strategy proposal methods
-  [[nodiscard]] double calculate_toxicity_score(double cancel_rate, double obi, double short_vol) const noexcept;
   [[nodiscard]] double calculate_expected_pnl(double spread, double toxicity, double inventory_risk) const noexcept;
   [[nodiscard]] bool should_quote(double expected_pnl) const noexcept;
 
@@ -146,29 +146,14 @@ private:
 
   MarketMakerStats stats_;
 
-  // Strategy proposal parameters - calibrated for elite HFT
-  // Front-of-queue with excellent hedging = high fill rate, low adverse
-  double alpha1_ = 0.8;   // Lower cancel rate weight (confidence in speed)
-  double alpha2_ = 0.6;   // Lower OBI weight (can handle imbalance)
-  double alpha3_ = 0.3;   // Lower volatility weight
-  double mu_adverse_ = 0.003;  // Very low adverse expectation (excellent hedging)
-  double gamma_risk_ = 0.0005; // Very low inventory risk penalty
-  double fill_probability_ = 0.35;  // 35% expected fill rate (front of queue)
+  // Execution model parameters (calibrated for elite HFT)
+  double mu_adverse_ = 0.003;  // Expected adverse selection cost per share
+  double gamma_risk_ = 0.0005; // Inventory risk penalty
+  double fill_probability_ = 0.35;  // Expected fill rate (front of queue)
 
   // Online model override for toxicity score
   bool use_override_toxicity_ = false;
   double override_toxicity_ = 0.0;
-
-  // Rolling window for toxicity metrics
-  struct ToxicityWindow {
-    std::chrono::steady_clock::time_point start_time;
-    uint32_t cancel_count = 0;
-    uint32_t add_count = 0;
-    double sum_price_changes = 0.0;
-    int num_price_samples = 0;
-  };
-  mutable ToxicityWindow toxicity_window_;
-  double window_duration_ms_ = 1000.0;  // 1 second rolling window
 
   // Helper methods
   [[nodiscard]] double round_to_tick(double price) const noexcept;
@@ -177,4 +162,10 @@ private:
   [[nodiscard]] double sigmoid(double x) const noexcept;
   [[nodiscard]] double calculate_obi() const;  // Order Book Imbalance
   [[nodiscard]] double get_average_toxicity() const;  // Average toxicity across levels
+
+  // Snapshot-based overloads (single lock acquisition)
+  [[nodiscard]] double calculate_toxicity_adjusted_spread_snap(double base_spread_val,
+                                                               const OrderBook::BookSnapshot& snap) const;
+  [[nodiscard]] double get_average_toxicity_snap(const OrderBook::BookSnapshot& snap) const;
+  [[nodiscard]] static double calculate_obi_snap(const OrderBook::BookSnapshot& snap) ;
 };
