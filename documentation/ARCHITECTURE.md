@@ -2,13 +2,12 @@
 
 ## System Overview
 
-The NYSE-XDP platform is a C++17 market microstructure research system that processes NYSE XDP Integrated Feed PCAP data to simulate toxicity-screened market-making strategies. The system comprises four executables built from shared core libraries:
+The NYSE-XDP platform is a C++17 market microstructure research system that processes NYSE XDP Integrated Feed PCAP data to simulate toxicity-screened market-making strategies. The system comprises three executables built from shared core libraries:
 
 | Target | Purpose | Primary source |
 |--------|---------|---------------|
 | `market_maker_sim` | Parallelized backtesting engine (primary) | `market_maker_sim.cpp`, `per_symbol_sim.cpp` |
 | `reader` | CLI XDP message parser | `reader.cpp` |
-| `visualizer` | Standalone ImGui order book viewer | `visualization.cpp` |
 | `visualizer_pcap` | PCAP-driven order book visualizer | `visualizer_pcap.cpp` |
 
 ### Simulation Module Structure

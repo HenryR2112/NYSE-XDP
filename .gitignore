@@ -9,7 +9,7 @@ cmake-build*/
 *.exe
 *.out
 *.dSYM/
-
+sw
 # IDE and editor
 .vscode/settings.json
 *.swp
