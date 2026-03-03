@@ -33,6 +33,8 @@ void PerSymbolSim::ensure_init(uint32_t idx, const SimConfig& config) {
   double net_fee = -(config.exec.maker_rebate_per_share - config.exec.clearing_fee_per_share);
   mm_baseline.set_fee_per_share(net_fee);
   mm_toxicity.set_fee_per_share(net_fee);
+  mm_baseline.set_taker_fee_per_share(config.exec.taker_fee_per_share);
+  mm_toxicity.set_taker_fee_per_share(config.exec.taker_fee_per_share);
 
   // Apply CLI-overridden toxicity parameters
   if (config.toxicity_threshold > 0.0) {
@@ -41,10 +43,17 @@ void PerSymbolSim::ensure_init(uint32_t idx, const SimConfig& config) {
   if (config.toxicity_multiplier > 0.0) {
     mm_toxicity.set_toxicity_multiplier(config.toxicity_multiplier);
   }
+  mm_toxicity.set_ablation_mode(config.ablation_mode);
+  mm_toxicity.set_epsilon_min(config.epsilon_min);
 
   // Initialize online learning model with CLI params
   if (config.online_learning) {
     online_model = OnlineToxicityModel(config.learning_rate, config.warmup_fills);
+  }
+
+  // Initialize EWMA filter if selected
+  if (config.filter_type == FilterType::EWMA) {
+    ewma_filter = EWMAFilter(config.ewma_alpha, config.ewma_threshold_k, config.ewma_min_obs);
   }
 }
 
@@ -76,7 +85,7 @@ uint32_t PerSymbolSim::calculate_queue_position(double price, char side) {
   return static_cast<uint32_t>(std::max(0.0, pos));
 }
 
-bool PerSymbolSim::check_eligibility() {
+bool PerSymbolSim::check_eligibility() const {
   auto stats = order_book.get_stats();
 
   // Need valid BBO
@@ -93,7 +102,7 @@ bool PerSymbolSim::check_eligibility() {
   return true;
 }
 
-bool PerSymbolSim::check_risk_limits(SymbolRiskState& risk) {
+bool PerSymbolSim::check_risk_limits(SymbolRiskState& risk) const {
   double total_pnl = risk.realized_pnl + risk.unrealized_pnl + risk.total_adverse_pnl;
   if (total_pnl < -config_->exec.max_daily_loss_per_symbol) {
     risk.halted = true;
@@ -102,7 +111,7 @@ bool PerSymbolSim::check_risk_limits(SymbolRiskState& risk) {
   return true;
 }
 
-ToxicityFeatureVector PerSymbolSim::build_feature_vector() {
+ToxicityFeatureVector PerSymbolSim::build_feature_vector() const {
   ToxicityFeatureVector fv;
 
   // Average the 5 order-book features across top 3 bid + 3 ask levels
@@ -110,6 +119,10 @@ ToxicityFeatureVector PerSymbolSim::build_feature_vector() {
   int count = 0;
   auto bids = order_book.get_bids();
   auto asks = order_book.get_asks();
+
+  // Also accumulate cancel volume intensity across levels
+  double total_vol_cancelled = 0.0;
+  double total_vol_added = 0.0;
 
   int bid_levels = 0;
   for (const auto& [price, qty] : bids) {
@@ -120,6 +133,9 @@ ToxicityFeatureVector PerSymbolSim::build_feature_vector() {
     fv.features[2] += fr.odd_lot_ratio;
     fv.features[3] += fr.precision_ratio;
     fv.features[4] += fr.resistance_ratio;
+    auto tm = order_book.get_toxicity_metrics(price, 'B');
+    total_vol_cancelled += tm.total_volume_cancelled;
+    total_vol_added += tm.total_volume_added;
     count++;
     bid_levels++;
   }
@@ -132,6 +148,9 @@ ToxicityFeatureVector PerSymbolSim::build_feature_vector() {
     fv.features[2] += fr.odd_lot_ratio;
     fv.features[3] += fr.precision_ratio;
     fv.features[4] += fr.resistance_ratio;
+    auto tm = order_book.get_toxicity_metrics(price, 'S');
+    total_vol_cancelled += tm.total_volume_cancelled;
+    total_vol_added += tm.total_volume_added;
     count++;
     ask_levels++;
   }
@@ -139,10 +158,70 @@ ToxicityFeatureVector PerSymbolSim::build_feature_vector() {
     for (int i = 0; i < 5; i++) fv.features[i] /= count;
   }
 
-  // New temporal features
+  // Temporal dynamics
   fv.features[5] = trade_flow.get_imbalance();
   fv.features[6] = spread_tracker.get_spread_change_rate();
   fv.features[7] = momentum_tracker.get_momentum();
+
+  // --- Structural features (book-wide) ---
+  auto stats = order_book.get_stats();
+
+  // [8] Cancel volume intensity: volume_cancelled / volume_added
+  fv.features[8] = (total_vol_added > 0)
+      ? total_vol_cancelled / total_vol_added
+      : 0.0;
+
+  // [9] Top-of-book concentration: avg fraction of total depth at best level
+  double bid_conc = (stats.total_bid_qty > 0 && !bids.empty())
+      ? static_cast<double>(bids.begin()->second) / static_cast<double>(stats.total_bid_qty)
+      : 0.0;
+  double ask_conc = (stats.total_ask_qty > 0 && !asks.empty())
+      ? static_cast<double>(asks.begin()->second) / static_cast<double>(stats.total_ask_qty)
+      : 0.0;
+  fv.features[9] = (bid_conc + ask_conc) / 2.0;
+
+  // [10] Depth imbalance: (bid_qty - ask_qty) / total_qty (OFI proxy)
+  double total_qty = static_cast<double>(stats.total_bid_qty) + static_cast<double>(stats.total_ask_qty);
+  fv.features[10] = (total_qty > 0)
+      ? (static_cast<double>(stats.total_bid_qty) - static_cast<double>(stats.total_ask_qty)) / total_qty
+      : 0.0;
+
+  // [11] Level count asymmetry
+  double total_levels = static_cast<double>(stats.bid_levels + stats.ask_levels);
+  fv.features[11] = (total_levels > 0)
+      ? static_cast<double>(stats.bid_levels - stats.ask_levels) / total_levels
+      : 0.0;
+
+  // [12] Absolute trade flow imbalance (VPIN magnitude — Easley, López de Prado & O'Hara)
+  fv.features[12] = std::abs(fv.features[5]);
+
+  // [13] Large order ratio: large_order_count / total_events across top levels
+  double total_large = 0.0;
+  double total_events_all = 0.0;
+  {
+    int lvl = 0;
+    for (const auto& [price, qty] : bids) {
+      if (lvl >= 3) break;
+      auto tm = order_book.get_toxicity_metrics(price, 'B');
+      total_large += tm.large_order_count;
+      total_events_all += tm.adds + tm.cancels;
+      lvl++;
+    }
+    lvl = 0;
+    for (const auto& [price, qty] : asks) {
+      if (lvl >= 3) break;
+      auto tm = order_book.get_toxicity_metrics(price, 'S');
+      total_large += tm.large_order_count;
+      total_events_all += tm.adds + tm.cancels;
+      lvl++;
+    }
+  }
+  fv.features[13] = (total_events_all > 0) ? total_large / total_events_all : 0.0;
+
+  // [14] Normalized spread: spread / mid_price (relative transaction cost)
+  fv.features[14] = (stats.mid_price > 0)
+      ? stats.spread / stats.mid_price
+      : 0.0;
 
   return fv;
 }
@@ -183,7 +262,8 @@ void PerSymbolSim::measure_adverse_selection(std::vector<FillRecord>& fills,
     }
 
     // Train online model: label = was there meaningful adverse selection?
-    if (config_->online_learning) {
+    // Only train SGD for logistic filter; EWMA updates in update_quotes() instead.
+    if (config_->online_learning && config_->filter_type == FilterType::LOGISTIC) {
       bool was_adverse = (adverse_move > 0.005);  // > half a cent threshold
       online_model.update(fill.features, was_adverse);
     }
@@ -265,26 +345,145 @@ void PerSymbolSim::update_quotes(uint64_t now_ns) {
     if (book_stats.mid_price > 0) momentum_tracker.record_mid(book_stats.mid_price);
   }
 
+  // End-of-day liquidation: MUST come before eligibility check.
+  // By 15:50 ET, book depth thins out and symbols may fail eligibility —
+  // but we still need to force-close any open positions.
+  // Uses gmtime_r (UTC) since PCAP timestamps are Unix epoch.
+  // Aug 22 2023 is EDT: NYSE 15:50 ET = 19:50 UTC = 71400 seconds into UTC day
+  if (!eod_liquidated) {
+    uint64_t now_sec = now_ns / 1000000000ULL;
+    time_t t = static_cast<time_t>(now_sec);
+    struct tm tm_utc;
+    gmtime_r(&t, &tm_utc);
+    int seconds_into_utc_day = tm_utc.tm_hour * 3600 + tm_utc.tm_min * 60 + tm_utc.tm_sec;
+    if (seconds_into_utc_day >= 71400) {
+      mm_baseline.force_close_position();
+      mm_toxicity.force_close_position();
+      eod_liquidated = true;
+      eligible_to_trade = false;
+      return;
+    }
+  } else {
+    eligible_to_trade = false;
+    return;
+  }
+
   // Check eligibility and risk limits
   eligible_to_trade = check_eligibility();
   if (!eligible_to_trade) return;
+
+  if (blacklisted) {
+    eligible_to_trade = false;
+    return;
+  }
 
   if (!check_risk_limits(baseline_risk) || !check_risk_limits(toxicity_risk)) {
     return;
   }
 
-  // Feed online model prediction to toxicity strategy
-  if (config_->online_learning && !online_model.in_warmup()) {
+  // Per-symbol blacklisting: check every 50 fills if this symbol is a persistent loser
+  int64_t total_fills = baseline_risk.total_fills + toxicity_risk.total_fills;
+  if (total_fills >= blacklist_check_fills + 50) {
+    blacklist_check_fills = total_fills;
+    double baseline_pnl = baseline_risk.realized_pnl + baseline_risk.total_adverse_pnl;
+    double toxicity_pnl = toxicity_risk.realized_pnl + toxicity_risk.total_adverse_pnl;
+    // Blacklist if BOTH strategies are losing badly after enough fills
+    if (total_fills >= 100 && baseline_pnl < -500.0 && toxicity_pnl < -500.0) {
+      blacklisted = true;
+      eligible_to_trade = false;
+      return;
+    }
+  }
+
+  // Walk-forward window boundary detection
+  if (config_->walk_forward && config_->online_learning) {
+    if (!wf_initialized) {
+      wf_window_duration_ns = static_cast<uint64_t>(config_->wf_window_minutes) * 60ULL * 1000000000ULL;
+      wf_window_start_ns = now_ns;
+      wf_initialized = true;
+      current_wf_window = 0;
+    }
+
+    uint64_t elapsed = now_ns - wf_window_start_ns;
+    int new_window = static_cast<int>(elapsed / wf_window_duration_ns);
+
+    if (new_window > current_wf_window) {
+      // Snapshot current window's PnL before transition
+      const auto tox_stats = mm_toxicity.get_stats();
+      const auto base_stats = mm_baseline.get_stats();
+      WFWindowMetrics wm;
+      wm.window_id = current_wf_window;
+      wm.toxicity_pnl = tox_stats.realized_pnl + tox_stats.unrealized_pnl
+                         + toxicity_risk.total_adverse_pnl;
+      wm.baseline_pnl = base_stats.realized_pnl + base_stats.unrealized_pnl
+                         + baseline_risk.total_adverse_pnl;
+      wm.fills = toxicity_risk.total_fills;
+      wm.suppressed = tox_stats.quotes_suppressed;
+      wf_window_metrics.push_back(wm);
+
+      // Window boundary crossed:
+      // 1. Snapshot current learned weights
+      auto snap = online_model.snapshot();
+      // 2. Apply as frozen weights for next window predictions
+      online_model.apply_frozen(snap);
+      // 3. Reset learning state for new window (keeps normalization stats)
+      online_model.reset_for_new_window();
+      current_wf_window = new_window;
+    }
+  }
+
+  // Feed toxicity prediction to toxicity strategy based on filter type
+  if (config_->filter_type == FilterType::EWMA) {
     auto fv = build_feature_vector();
-    double predicted_toxicity = online_model.predict(fv);
+    double cancel_ratio = fv.features[0];  // cancel_ratio is feature[0]
+
+    if (!ewma_filter.in_warmup()) {
+      double predicted_toxicity = ewma_filter.predict(cancel_ratio);
+      mm_toxicity.set_override_toxicity(predicted_toxicity);
+    }
+
+    // Update EWMA with each observation (even during warmup)
+    ewma_filter.update(cancel_ratio);
+  } else if (config_->online_learning && !online_model.in_warmup()) {
+    // Logistic model path
+    auto fv = build_feature_vector();
+    double predicted_toxicity;
+    if (config_->walk_forward && online_model.has_frozen) {
+      // Walk-forward: use frozen weights from prior window
+      predicted_toxicity = online_model.predict_frozen(fv);
+    } else {
+      predicted_toxicity = online_model.predict(fv);
+    }
+    mm_toxicity.set_override_toxicity(predicted_toxicity);
+  } else if (config_->walk_forward && config_->online_learning && online_model.has_frozen) {
+    // During warmup in walk-forward mode, still use frozen weights if available
+    auto fv = build_feature_vector();
+    double predicted_toxicity = online_model.predict_frozen(fv);
     mm_toxicity.set_override_toxicity(predicted_toxicity);
   }
 
   mm_baseline.update_market_data();
   mm_toxicity.update_market_data();
 
+  // Active inventory management: cross the spread to unwind excess inventory
+  mm_baseline.try_unwind_inventory();
+  mm_toxicity.try_unwind_inventory();
+
   const MarketMakerQuote q_base = mm_baseline.get_current_quotes();
   const MarketMakerQuote q_tox = mm_toxicity.get_current_quotes();
+
+  // Track queue resets: check if virtual order will change before updating
+  auto check_reset = [](const VirtualOrder& vo, double price, uint32_t size) -> bool {
+    return vo.live && (vo.price != price || vo.size != size);
+  };
+  if (check_reset(baseline_state.bid, q_base.bid_price, q_base.bid_size))
+    diag_baseline.quote_resets++;
+  if (check_reset(baseline_state.ask, q_base.ask_price, q_base.ask_size))
+    diag_baseline.quote_resets++;
+  if (check_reset(toxicity_state.bid, q_tox.bid_price, q_tox.bid_size))
+    diag_toxicity.quote_resets++;
+  if (check_reset(toxicity_state.ask, q_tox.ask_price, q_tox.ask_size))
+    diag_toxicity.quote_resets++;
 
   update_virtual_order(baseline_state.bid, q_base.bid_price, q_base.bid_size,
                        'B', now_ns);
@@ -302,9 +501,9 @@ void PerSymbolSim::on_add(uint64_t order_id, double price, uint32_t volume,
   order_info[order_id] = {side, price, volume, now_ns};
   order_book.add_order(order_id, price, volume, side);
 
-  // Periodic cleanup of stale orders (every 10 seconds of market time)
-  constexpr uint64_t CLEANUP_INTERVAL_NS = 10ULL * 1000000000ULL;  // 10 seconds
-  constexpr uint64_t MAX_ORDER_AGE_NS = 60ULL * 1000000000ULL;     // 60 seconds max age
+  // Periodic cleanup of stale orders (every 60 seconds of market time)
+  constexpr uint64_t CLEANUP_INTERVAL_NS = 60ULL * 1000000000ULL;  // 60 seconds
+  constexpr uint64_t MAX_ORDER_AGE_NS = 600ULL * 1000000000ULL;    // 10 minutes max age
   if (now_ns - last_cleanup_ns > CLEANUP_INTERVAL_NS) {
     last_cleanup_ns = now_ns;
     // Remove orders older than MAX_ORDER_AGE_NS
@@ -377,22 +576,31 @@ void PerSymbolSim::on_replace(uint64_t old_order_id, uint64_t new_order_id,
 void PerSymbolSim::try_fill_one(MarketMakerStrategy& mm, StrategyExecState& st,
                                  std::vector<FillRecord>& pending_fills,
                                  SymbolRiskState& risk,
+                                 FillDiagnostics& diag,
                                  bool is_bid_side, double exec_price,
                                  uint32_t exec_qty, uint64_t now_ns) {
+  diag.try_fill_calls++;
+
   // Check if halted due to loss limits
-  if (risk.halted) return;
+  if (risk.halted) { diag.rejected_halted++; return; }
 
   VirtualOrder& vo = is_bid_side ? st.bid : st.ask;
-  if (!vo.live || vo.remaining == 0)
+  if (!vo.live || vo.remaining == 0) {
+    diag.rejected_not_live++;
     return;
+  }
 
   // Order must be active (past latency period)
-  if (now_ns < vo.active_at_ns)
+  if (now_ns < vo.active_at_ns) {
+    diag.rejected_latency++;
     return;
+  }
 
   // Check price eligibility
-  if (!eligible_for_fill(vo.price, exec_price, is_bid_side))
+  if (!eligible_for_fill(vo.price, exec_price, is_bid_side)) {
+    diag.rejected_price++;
     return;
+  }
 
   // During quote exposure window, we're more vulnerable to adverse fills
   // Model this as higher fill probability (bad fills get through)
@@ -408,8 +616,10 @@ void PerSymbolSim::try_fill_one(MarketMakerStrategy& mm, StrategyExecState& st,
   }
   // During exposure window, skip queue logic (we get adversely picked off)
 
-  if (qty_left == 0)
+  if (qty_left == 0) {
+    diag.rejected_queue++;
     return;
+  }
 
   const uint32_t fill_qty = std::min(vo.remaining, qty_left);
   if (fill_qty == 0)
@@ -419,6 +629,10 @@ void PerSymbolSim::try_fill_one(MarketMakerStrategy& mm, StrategyExecState& st,
   vo.remaining -= fill_qty;
   mm.on_order_filled(is_bid_side, vo.price, fill_qty);
   risk.total_fills++;
+  diag.fill_succeeded++;
+
+  // Let inventory accumulate; periodic unwind in update_quotes() handles excess.
+  // Immediate unwind after fill is self-defeating: taker fees > rebate income.
 
   // Track inventory variance for hypothesis testing H3
   risk.update_inventory_variance(mm.get_inventory());
@@ -435,7 +649,9 @@ void PerSymbolSim::try_fill_one(MarketMakerStrategy& mm, StrategyExecState& st,
   // Build feature vector and store with fill
   record.features = build_feature_vector();
 
-  if (config_->online_learning && !online_model.in_warmup()) {
+  if (config_->filter_type == FilterType::EWMA && !ewma_filter.in_warmup()) {
+    record.toxicity_at_fill = ewma_filter.predict(record.features.features[0]);
+  } else if (config_->online_learning && !online_model.in_warmup()) {
     record.toxicity_at_fill = online_model.predict(record.features);
   } else {
     record.toxicity_at_fill = mm.get_current_toxicity();
@@ -445,29 +661,36 @@ void PerSymbolSim::try_fill_one(MarketMakerStrategy& mm, StrategyExecState& st,
 
 void PerSymbolSim::maybe_fill_on_execution(char resting_side, double exec_price,
                                             uint32_t exec_qty, uint64_t now_ns) {
+  // Try fills with EXISTING virtual orders first (before updating them).
+  // In real trading, resting orders are already on the exchange when an
+  // execution happens — the fill check should use the current state.
+  // Updating quotes afterward adjusts prices for the NEXT execution.
+  if (eligible_to_trade) {
+    if (resting_side == 'B') {
+      try_fill_one(mm_baseline, baseline_state, baseline_pending_fills,
+                   baseline_risk, diag_baseline, true, exec_price, exec_qty, now_ns);
+      try_fill_one(mm_toxicity, toxicity_state, toxicity_pending_fills,
+                   toxicity_risk, diag_toxicity, true, exec_price, exec_qty, now_ns);
+    } else if (resting_side == 'S') {
+      try_fill_one(mm_baseline, baseline_state, baseline_pending_fills,
+                   baseline_risk, diag_baseline, false, exec_price, exec_qty, now_ns);
+      try_fill_one(mm_toxicity, toxicity_state, toxicity_pending_fills,
+                   toxicity_risk, diag_toxicity, false, exec_price, exec_qty, now_ns);
+    }
+  } else {
+    diag_baseline.exec_not_eligible++;
+    diag_toxicity.exec_not_eligible++;
+  }
+
+  // THEN update quotes for the next execution cycle
   update_quotes(now_ns);
-
-  // Skip if not eligible to trade this symbol
-  if (!eligible_to_trade) return;
-
-  if (resting_side == 'B') {
-    try_fill_one(mm_baseline, baseline_state, baseline_pending_fills,
-                 baseline_risk, true, exec_price, exec_qty, now_ns);
-    try_fill_one(mm_toxicity, toxicity_state, toxicity_pending_fills,
-                 toxicity_risk, true, exec_price, exec_qty, now_ns);
-    return;
-  }
-
-  if (resting_side == 'S') {
-    try_fill_one(mm_baseline, baseline_state, baseline_pending_fills,
-                 baseline_risk, false, exec_price, exec_qty, now_ns);
-    try_fill_one(mm_toxicity, toxicity_state, toxicity_pending_fills,
-                 toxicity_risk, false, exec_price, exec_qty, now_ns);
-  }
 }
 
 void PerSymbolSim::on_execute(uint64_t order_id, uint32_t exec_qty,
                                double exec_price, uint64_t now_ns) {
+  diag_baseline.exec_total++;
+  diag_toxicity.exec_total++;
+
   auto it = order_info.find(order_id);
   if (it != order_info.end()) {
     // Feed trade flow tracker with execution side
@@ -482,6 +705,14 @@ void PerSymbolSim::on_execute(uint64_t order_id, uint32_t exec_qty,
     } else {
       order_info.erase(it);
     }
+  } else {
+    diag_baseline.exec_no_order_info++;
+    diag_toxicity.exec_no_order_info++;
+
+    // Order ID not in our map (cross-group boundary or cleaned up).
+    // Try both sides — price eligibility in try_fill_one prevents wrong-side fills.
+    maybe_fill_on_execution('B', exec_price, exec_qty, now_ns);
+    maybe_fill_on_execution('S', exec_price, exec_qty, now_ns);
   }
 
   order_book.execute_order(order_id, exec_qty, exec_price);

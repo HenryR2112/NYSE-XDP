@@ -653,7 +653,7 @@ int main(int argc, char *argv[]) {
 
   // Load symbol mapping if provided
   if (symbol_file) {
-    xdp::load_symbol_map(symbol_file);
+    (void)xdp::load_symbol_map(symbol_file);
   }
 
   // Open PCAP file

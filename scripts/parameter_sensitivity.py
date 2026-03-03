@@ -24,9 +24,9 @@ from pathlib import Path
 
 
 def find_pcap_files(data_dir=None):
+    """Find all PCAP files in data directory."""
     if data_dir is None:
         data_dir = "data/uncompressed-ny4-xnyx-pillar-a-20230822"
-    """Find all PCAP files in data directory."""
     pcaps = sorted(Path(data_dir).glob("*.pcap"))
     return [str(p) for p in pcaps]
 

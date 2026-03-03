@@ -22,11 +22,11 @@ struct StrategyExecState {
 
 // Track fills for adverse selection measurement
 struct FillRecord {
-  uint64_t fill_time_ns;
-  double fill_price;
-  uint32_t fill_qty;
-  bool is_buy;
-  double mid_price_at_fill;
+  uint64_t fill_time_ns = 0;
+  double fill_price = 0.0;
+  uint32_t fill_qty = 0;
+  bool is_buy = false;
+  double mid_price_at_fill = 0.0;
   double toxicity_at_fill = 0.0;  // Toxicity score at time of fill
   bool adverse_measured = false;
   double adverse_pnl = 0.0;

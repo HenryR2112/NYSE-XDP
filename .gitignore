@@ -10,6 +10,8 @@ cmake-build*/
 *.out
 *.dSYM/
 sw
+.claude
+results
 # IDE and editor
 .vscode/settings.json
 *.swp

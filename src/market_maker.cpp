@@ -2,6 +2,51 @@
 #include <algorithm>
 #include <cmath>
 
+// ---- EWMAFilter implementation ----
+
+EWMAFilter::EWMAFilter(double a, double k, int min_obs)
+    : alpha(a), threshold_k(k), min_observations(min_obs) {}
+
+void EWMAFilter::update(double cancel_ratio) {
+  n_observations++;
+  if (n_observations == 1) {
+    ewma_mean = cancel_ratio;
+    ewma_var = 0.0;
+  } else {
+    double delta = cancel_ratio - ewma_mean;
+    ewma_mean = (1.0 - alpha) * ewma_mean + alpha * cancel_ratio;
+    // EWMA variance: exponentially weighted variance
+    ewma_var = (1.0 - alpha) * (ewma_var + alpha * delta * delta);
+  }
+}
+
+double EWMAFilter::get_std() const {
+  return std::sqrt(std::max(ewma_var, 1e-10));
+}
+
+double EWMAFilter::get_threshold() const {
+  return ewma_mean + threshold_k * get_std();
+}
+
+bool EWMAFilter::in_warmup() const {
+  return n_observations < min_observations;
+}
+
+double EWMAFilter::predict(double cancel_ratio) const {
+  if (in_warmup()) return 0.0;  // No signal during warmup
+  double z = (cancel_ratio - ewma_mean) / get_std();
+  // Normalize so that threshold_k maps to 0.5, clip to [0, 1]
+  // Negative z means below-average cancel ratio (safe) -> 0
+  return std::max(0.0, std::min(1.0, z / (2.0 * threshold_k)));
+}
+
+bool EWMAFilter::is_toxic(double cancel_ratio) const {
+  if (in_warmup()) return false;
+  return cancel_ratio > get_threshold();
+}
+
+// ---- MarketMakerStrategy implementation ----
+
 MarketMakerStrategy::MarketMakerStrategy(OrderBook &ob, bool use_toxicity)
     : order_book_(ob), use_toxicity_screen_(use_toxicity) {
   stats_.start_time = std::chrono::steady_clock::now();
@@ -109,6 +154,16 @@ void MarketMakerStrategy::set_override_toxicity(double toxicity) {
   override_toxicity_ = toxicity;
 }
 
+void MarketMakerStrategy::set_ablation_mode(mmsim::AblationMode mode) {
+  std::lock_guard<std::mutex> lock(strategy_mutex_);
+  ablation_mode_ = mode;
+}
+
+void MarketMakerStrategy::set_epsilon_min(double eps) {
+  std::lock_guard<std::mutex> lock(strategy_mutex_);
+  epsilon_min_ = eps;
+}
+
 void MarketMakerStrategy::clear_override_toxicity() {
   use_override_toxicity_ = false;
   override_toxicity_ = 0.0;
@@ -175,13 +230,30 @@ void MarketMakerStrategy::update_market_data() {
   }
 
   double mid_price = snap.stats.mid_price;
-  double spread = calculate_toxicity_adjusted_spread_snap(base_spread_, snap);
+
+  // Spread widening: active in FULL and SPREAD_ONLY modes
+  const bool apply_spread =
+      use_toxicity_screen_ &&
+      (ablation_mode_ == mmsim::AblationMode::FULL ||
+       ablation_mode_ == mmsim::AblationMode::SPREAD_ONLY);
+  double spread = apply_spread
+      ? calculate_toxicity_adjusted_spread_snap(base_spread_, snap)
+      : base_spread_;
+
   double half_spread = spread / 2.0;
   double inventory_skew = calculate_inventory_skew();
 
+  // PnL filter: active in FULL and PNL_FILTER_ONLY modes
+  const bool apply_pnl_filter =
+      use_toxicity_screen_ &&
+      (ablation_mode_ == mmsim::AblationMode::FULL ||
+       ablation_mode_ == mmsim::AblationMode::PNL_FILTER_ONLY);
+
   if (use_toxicity_screen_) {
     stats_.avg_toxicity = avg_toxicity;
+  }
 
+  if (apply_pnl_filter) {
     // Skip quoting entirely if toxicity is too high
     if (avg_toxicity > toxicity_quote_threshold_) {
       stats_.quotes_suppressed++;
@@ -191,9 +263,11 @@ void MarketMakerStrategy::update_market_data() {
       return;
     }
 
-    // Calculate expected PnL and check if we should quote
+    // Calculate expected PnL using BASE spread (not toxicity-adjusted).
+    // Fills near NBBO capture approximately base spread, regardless of our wider quote.
+    // The wider spread reduces fill rate but doesn't increase per-fill income proportionally.
     double inventory_risk = gamma_risk_ * inventory_ * inventory_;
-    double expected_pnl = calculate_expected_pnl(spread, avg_toxicity, inventory_risk);
+    double expected_pnl = calculate_expected_pnl(base_spread_, avg_toxicity, inventory_risk);
 
     if (!should_quote(expected_pnl)) {
       stats_.quotes_suppressed++;
@@ -215,44 +289,49 @@ void MarketMakerStrategy::update_market_data() {
     current_quotes_.ask_price = round_to_tick(mid_price + tick_size_);
   }
 
-  // Start with base sizes
+  // Quote at full size — maximize fill opportunities
   current_quotes_.bid_size = base_quote_size_;
   current_quotes_.ask_size = base_quote_size_;
 
-  // Adjust quote sizes based on inventory (more aggressive)
+  // Inventory-proportional size skew: aggressively favor offsetting side
   double inventory_pct = static_cast<double>(inventory_) / max_position_;
-  if (inventory_pct > 0.7) {
-    // Very long: stop buying, sell aggressively
+  if (inventory_pct > 0.8) {
+    // Very long: stop buying entirely, sell at 3x
     current_quotes_.bid_size = 0;
     current_quotes_.ask_size = base_quote_size_ * 3;
   } else if (inventory_pct > 0.3) {
-    // Moderately long: reduce buying, increase selling
-    current_quotes_.bid_size = base_quote_size_ / 2;
-    current_quotes_.ask_size = base_quote_size_ * 2;
-  } else if (inventory_pct < -0.7) {
-    // Very short: stop selling, buy aggressively
+    // Long: ramp down buying, ramp up selling (0→1 over 0.3..0.8 range)
+    double ratio = (inventory_pct - 0.3) / 0.5;  // 0..1
+    current_quotes_.bid_size = static_cast<uint32_t>(base_quote_size_ * (1.0 - 0.8 * ratio));
+    current_quotes_.ask_size = static_cast<uint32_t>(base_quote_size_ * (1.0 + ratio));
+  } else if (inventory_pct < -0.8) {
+    // Very short: stop selling entirely, buy at 3x
     current_quotes_.bid_size = base_quote_size_ * 3;
     current_quotes_.ask_size = 0;
   } else if (inventory_pct < -0.3) {
-    // Moderately short: reduce selling, increase buying
-    current_quotes_.bid_size = base_quote_size_ * 2;
-    current_quotes_.ask_size = base_quote_size_ / 2;
+    // Short: ramp down selling, ramp up buying
+    double ratio = (-inventory_pct - 0.3) / 0.5;
+    current_quotes_.bid_size = static_cast<uint32_t>(base_quote_size_ * (1.0 + ratio));
+    current_quotes_.ask_size = static_cast<uint32_t>(base_quote_size_ * (1.0 - 0.8 * ratio));
   }
 
-  // OBI-based quote adjustment (only for toxicity-aware strategy)
-  if (use_toxicity_screen_) {
-    // Strong positive OBI (more bids) suggests price going up
-    // -> safer to buy, riskier to sell
-    if (obi > obi_threshold_) {
-      // Price likely going up: reduce/skip sell side
-      current_quotes_.ask_size = current_quotes_.ask_size / 2;
-      // Widen ask price to avoid adverse selection
-      current_quotes_.ask_price = round_to_tick(current_quotes_.ask_price + tick_size_);
-    } else if (obi < -obi_threshold_) {
-      // Price likely going down: reduce/skip buy side
-      current_quotes_.bid_size = current_quotes_.bid_size / 2;
-      // Widen bid price to avoid adverse selection
-      current_quotes_.bid_price = round_to_tick(current_quotes_.bid_price - tick_size_);
+  // OBI-based asymmetric spread: active in FULL and OBI_ONLY modes
+  // Continuous adjustment: tighten the safe side, widen the risky side
+  const bool apply_obi =
+      use_toxicity_screen_ &&
+      (ablation_mode_ == mmsim::AblationMode::FULL ||
+       ablation_mode_ == mmsim::AblationMode::OBI_ONLY);
+  if (apply_obi && std::abs(obi) > 0.01) {
+    // Positive OBI (more bids, price going up): buying safe, selling risky
+    double obi_factor = std::clamp(obi * 0.5, -0.3, 0.3);
+    double bid_half = half_spread * (1.0 - obi_factor);  // tighter when OBI>0
+    double ask_half = half_spread * (1.0 + obi_factor);  // wider when OBI>0
+    current_quotes_.bid_price = round_to_tick(mid_price - bid_half + inventory_skew);
+    current_quotes_.ask_price = round_to_tick(mid_price + ask_half + inventory_skew);
+    // Ensure bid < ask
+    if (current_quotes_.bid_price >= current_quotes_.ask_price) {
+      current_quotes_.bid_price = round_to_tick(mid_price - tick_size_);
+      current_quotes_.ask_price = round_to_tick(mid_price + tick_size_);
     }
   }
 
@@ -363,6 +442,115 @@ void MarketMakerStrategy::set_fee_per_share(double fee) {
   fee_per_share_ = fee;
 }
 
+void MarketMakerStrategy::set_taker_fee_per_share(double fee) {
+  std::lock_guard<std::mutex> lock(strategy_mutex_);
+  taker_fee_per_share_ = fee;
+}
+
+void MarketMakerStrategy::try_unwind_inventory() {
+  // Two triggers for crossing the spread to close:
+  // 1. Take-profit: mark has moved favorably by take_profit_threshold_
+  // 2. Safety unwind: |inventory| exceeds unwind_threshold_
+
+  // Get snapshot without holding strategy_mutex_ (order_book has its own lock)
+  auto snap = order_book_.get_snapshot();
+  if (snap.stats.best_bid <= 0 || snap.stats.best_ask <= 0) return;
+
+  std::lock_guard<std::mutex> lock(strategy_mutex_);
+
+  if (inventory_ == 0) return;
+
+  int64_t abs_inv = std::abs(inventory_);
+  int64_t unwind_qty = 0;
+
+  if (inventory_ > 0) {
+    double mark = snap.stats.best_bid;
+    double unrealized_per_share = mark - avg_entry_price_;
+
+    if (unrealized_per_share >= take_profit_threshold_) {
+      // Take profit: close entire position
+      unwind_qty = inventory_;
+    } else if (abs_inv > unwind_threshold_) {
+      // Safety: trim excess only
+      unwind_qty = abs_inv - unwind_threshold_;
+    }
+
+    if (unwind_qty <= 0) return;
+
+    double qty_d = static_cast<double>(unwind_qty);
+    int64_t close_qty = std::min(unwind_qty, inventory_);
+    realized_pnl_ += (mark - avg_entry_price_) * static_cast<double>(close_qty);
+    inventory_ -= close_qty;
+    if (inventory_ == 0) avg_entry_price_ = 0.0;
+    realized_pnl_ -= taker_fee_per_share_ * qty_d;
+    stats_.sell_fills++;
+    stats_.total_fills++;
+    stats_.total_volume_traded += static_cast<uint32_t>(unwind_qty);
+    stats_.unwind_crosses++;
+    stats_.unwind_cost += taker_fee_per_share_ * qty_d;
+  } else {
+    double mark = snap.stats.best_ask;
+    double unrealized_per_share = avg_entry_price_ - mark;
+
+    if (unrealized_per_share >= take_profit_threshold_) {
+      // Take profit: close entire position
+      unwind_qty = -inventory_;
+    } else if (abs_inv > unwind_threshold_) {
+      // Safety: trim excess only
+      unwind_qty = abs_inv - unwind_threshold_;
+    }
+
+    if (unwind_qty <= 0) return;
+
+    double qty_d = static_cast<double>(unwind_qty);
+    int64_t close_qty = std::min(unwind_qty, -inventory_);
+    realized_pnl_ += (avg_entry_price_ - mark) * static_cast<double>(close_qty);
+    inventory_ += close_qty;
+    if (inventory_ == 0) avg_entry_price_ = 0.0;
+    realized_pnl_ -= taker_fee_per_share_ * qty_d;
+    stats_.buy_fills++;
+    stats_.total_fills++;
+    stats_.total_volume_traded += static_cast<uint32_t>(unwind_qty);
+    stats_.unwind_crosses++;
+    stats_.unwind_cost += taker_fee_per_share_ * qty_d;
+  }
+}
+
+void MarketMakerStrategy::force_close_position() {
+  auto snap = order_book_.get_snapshot();
+  if (snap.stats.best_bid <= 0 || snap.stats.best_ask <= 0) return;
+
+  std::lock_guard<std::mutex> lock(strategy_mutex_);
+  if (inventory_ == 0) return;
+
+  int64_t abs_inv = std::abs(inventory_);
+  double qty_d = static_cast<double>(abs_inv);
+
+  if (inventory_ > 0) {
+    double mark = snap.stats.best_bid;
+    realized_pnl_ += (mark - avg_entry_price_) * static_cast<double>(inventory_);
+    stats_.sell_fills++;
+  } else {
+    double mark = snap.stats.best_ask;
+    realized_pnl_ += (avg_entry_price_ - mark) * static_cast<double>(-inventory_);
+    stats_.buy_fills++;
+  }
+
+  inventory_ = 0;
+  avg_entry_price_ = 0.0;
+  unrealized_pnl_ = 0.0;
+  realized_pnl_ -= taker_fee_per_share_ * qty_d;
+  stats_.total_fills++;
+  stats_.total_volume_traded += static_cast<uint32_t>(abs_inv);
+  stats_.unwind_crosses++;
+  stats_.unwind_cost += taker_fee_per_share_ * qty_d;
+
+  // Stop quoting
+  current_quotes_.is_quoted = false;
+  current_quotes_.bid_size = 0;
+  current_quotes_.ask_size = 0;
+}
+
 void MarketMakerStrategy::register_our_order(uint64_t order_id) {
   std::lock_guard<std::mutex> lock(strategy_mutex_);
   our_order_ids_[order_id] = true;
@@ -438,9 +626,7 @@ double MarketMakerStrategy::calculate_expected_pnl(double spread, double toxicit
 }
 
 bool MarketMakerStrategy::should_quote(double expected_pnl) const noexcept {
-  // Require slightly positive expected PnL - lowered threshold for more fills
-  // while still filtering clearly unprofitable situations
-  return expected_pnl > 0.0005 && std::abs(inventory_) < max_position_;
+  return expected_pnl > epsilon_min_ && std::abs(inventory_) < max_position_;
 }
 
 // ---- OnlineToxicityModel implementation ----
@@ -479,6 +665,64 @@ double OnlineToxicityModel::predict(const ToxicityFeatureVector& fv) const {
     z += weights[i] * x_norm;
   }
   // Sigmoid
+  return 1.0 / (1.0 + std::exp(-z));
+}
+
+OnlineToxicityModel::WeightSnapshot OnlineToxicityModel::snapshot() const {
+  WeightSnapshot snap;
+  snap.weights = weights;
+  snap.bias = bias;
+  snap.feat_mean = feat_mean;
+  snap.feat_m2 = feat_m2;
+  snap.feat_count = feat_count;
+  snap.n_updates = n_updates;
+  return snap;
+}
+
+void OnlineToxicityModel::apply_frozen(const WeightSnapshot& snap) {
+  frozen_snap = snap;
+  has_frozen = true;
+}
+
+void OnlineToxicityModel::reset_for_new_window() {
+  // Reset learning state to initial weights (all N_TOXICITY_FEATURES)
+  weights = {0.40, 0.20, 0.15, 0.15, 0.10,   // book ratios
+             0.0, 0.0, 0.0,                    // temporal
+             0.0, 0.0, 0.0, 0.0,              // structural
+             0.0, 0.0, 0.0};                   // VPIN mag, large orders, norm spread
+  bias = 0.0;
+  n_updates = 0;
+  // Keep normalization stats (feat_mean, feat_m2, feat_count) continuous
+  // so z-score normalization remains stable across windows
+}
+
+double OnlineToxicityModel::predict_frozen(const ToxicityFeatureVector& fv) const {
+  if (!has_frozen) {
+    // No frozen weights yet (window 1) - fall back to live predict
+    return predict(fv);
+  }
+
+  // If frozen snapshot didn't pass warmup, use raw weighted sum (like predict during warmup)
+  if (frozen_snap.n_updates < warmup_fills) {
+    double score = 0.0;
+    for (int i = 0; i < N_TOXICITY_FEATURES; i++) {
+      score += frozen_snap.weights[i] * fv.features[i];
+    }
+    score += frozen_snap.bias;
+    return std::min(std::max(score, 0.0), 1.0);
+  }
+
+  // Post-warmup: normalize features using frozen normalization stats, then sigmoid
+  double z = frozen_snap.bias;
+  for (int i = 0; i < N_TOXICITY_FEATURES; i++) {
+    double std_dev = (frozen_snap.feat_count > 1)
+        ? std::sqrt(frozen_snap.feat_m2[i] / static_cast<double>(frozen_snap.feat_count - 1))
+        : 1.0;
+    double x_norm = (std_dev > 1e-10)
+        ? (fv.features[i] - frozen_snap.feat_mean[i]) / std_dev
+        : 0.0;
+    z += frozen_snap.weights[i] * x_norm;
+  }
   return 1.0 / (1.0 + std::exp(-z));
 }
 

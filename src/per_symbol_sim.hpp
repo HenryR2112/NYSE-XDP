@@ -57,9 +57,50 @@ struct PerSymbolSim {
 
   // Online learning feature trackers and model
   OnlineToxicityModel online_model;
+  EWMAFilter ewma_filter;
   TradeFlowTracker trade_flow;
   SpreadTracker spread_tracker;
   MomentumTracker momentum_tracker;
+
+  // Walk-forward analysis state (per-symbol window tracking)
+  int current_wf_window = 0;
+  uint64_t wf_window_start_ns = 0;
+  uint64_t wf_window_duration_ns = 0;
+  bool wf_initialized = false;
+
+  // Per-window metrics for walk-forward reporting
+  struct WFWindowMetrics {
+    int window_id = 0;
+    double toxicity_pnl = 0.0;
+    double baseline_pnl = 0.0;
+    int64_t fills = 0;
+    int64_t suppressed = 0;
+  };
+  std::vector<WFWindowMetrics> wf_window_metrics;
+
+  // Fill pipeline diagnostics — counts where potential fills are lost
+  struct FillDiagnostics {
+    uint64_t exec_total = 0;           // Total execution messages for this symbol
+    uint64_t exec_no_order_info = 0;   // Order ID not found (cleaned up or unknown)
+    uint64_t exec_not_eligible = 0;    // Symbol not eligible to trade
+    uint64_t try_fill_calls = 0;       // Total calls to try_fill_one
+    uint64_t rejected_halted = 0;      // Risk limits breached
+    uint64_t rejected_not_live = 0;    // Virtual order not live or remaining=0
+    uint64_t rejected_latency = 0;     // Still in latency window
+    uint64_t rejected_price = 0;       // Price not eligible (Cross mode)
+    uint64_t rejected_queue = 0;       // Queue ahead not consumed
+    uint64_t fill_succeeded = 0;       // Actual fills
+    uint64_t quote_resets = 0;         // Virtual order queue resets (price/size change)
+  };
+  FillDiagnostics diag_baseline;
+  FillDiagnostics diag_toxicity;
+
+  // End-of-day liquidation state
+  bool eod_liquidated = false;
+
+  // Per-symbol blacklisting: stop trading after persistent losses
+  bool blacklisted = false;
+  int64_t blacklist_check_fills = 0;  // Fills at last blacklist check
 
   // Pointer to runtime configuration (set during ensure_init)
   const SimConfig* config_ = nullptr;
@@ -76,13 +117,13 @@ struct PerSymbolSim {
   uint32_t calculate_queue_position(double price, char side);
 
   // Check if symbol meets eligibility criteria
-  bool check_eligibility();
+  bool check_eligibility() const;
 
   // Check if we've hit loss limits
-  bool check_risk_limits(SymbolRiskState& risk);
+  bool check_risk_limits(SymbolRiskState& risk) const;
 
   // Build current feature vector from order book and trackers
-  ToxicityFeatureVector build_feature_vector();
+  ToxicityFeatureVector build_feature_vector() const;
 
   // Measure adverse selection on pending fills
   void measure_adverse_selection(std::vector<FillRecord>& fills,
@@ -118,6 +159,7 @@ struct PerSymbolSim {
   void try_fill_one(MarketMakerStrategy& mm, StrategyExecState& st,
                     std::vector<FillRecord>& pending_fills,
                     SymbolRiskState& risk,
+                    FillDiagnostics& diag,
                     bool is_bid_side, double exec_price, uint32_t exec_qty,
                     uint64_t now_ns);
 
