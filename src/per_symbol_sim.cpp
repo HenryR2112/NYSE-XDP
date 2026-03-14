@@ -656,6 +656,11 @@ void PerSymbolSim::try_fill_one(MarketMakerStrategy& mm, StrategyExecState& st,
   } else {
     record.toxicity_at_fill = mm.get_current_toxicity();
   }
+
+  // Snapshot cumulative PnL at fill time (authoritative for figure generation)
+  auto mm_stats = mm.get_stats();
+  record.cumulative_pnl = mm_stats.realized_pnl + mm_stats.unrealized_pnl + risk.total_adverse_pnl;
+
   pending_fills.push_back(record);
 }
 

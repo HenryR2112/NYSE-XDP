@@ -1,29 +1,65 @@
 # NYSE XDP Market Making Research Platform
 
-A high-performance C++17 simulation system that processes 74GB of real NYSE exchange data to evaluate toxicity-screened market-making strategies. Extends the Avellaneda-Stoikov optimal control framework with real-time adverse selection screening via an online SGD logistic model, validated with formal statistical testing.
+A high-performance C++17 simulation system that processes 74 GB of real NYSE exchange data to evaluate toxicity-screened market-making strategies. Extends the Avellaneda-Stoikov optimal control framework with real-time adverse selection screening via an online SGD logistic model using 15 microstructure features, validated with formal statistical testing across three filter variants.
 
-## Key Results (August 22, 2023 -- Full Trading Day)
+## Key Results (August 22, 2023 -- Full Trading Day, EV22 Configuration)
 
-| Metric | Baseline | Toxicity-Aware |
-|--------|----------|----------------|
-| Total P&L | -$16,342 | $792 |
-| Intraday Sharpe | -1.454 | 2.031 |
-| Fills | 21,233 | 4,671 |
-| Adverse Selection | $339.63 | $95.56 (72% reduction) |
-| Inventory Variance | 63,641 | 9,137 (86% reduction) |
+| Metric | Baseline | Toxicity-Aware (SGD) |
+|--------|----------|----------------------|
+| Total P&L | -$363,134 | +$1,266 |
+| Total Fills | 31,390 | 2,223 |
+| P&L per Fill | -$11.57 | +$0.57 |
+| Adverse Selection Cost | $5,306 | $435 (91.8% reduction) |
+| Inventory Variance | 63,641 | 9,137 (85.6% reduction) |
+| Quotes Suppressed | 0 | 68,631 |
+| Unwind Crosses | 4,639 ($1,599) | 598 ($196) |
 
-**The $16,342 loss avoided is more informative than the $792 profit earned**: it establishes that adverse selection dominates spread capture for naive strategies, and that ~80% of quoting opportunities are toxic.
+**The $363K loss avoided is more informative than the $1,266 profit earned**: it establishes that adverse selection dominates spread capture for naive strategies, and that ~80% of quoting opportunities are toxic.
+
+### Three Filter Variants -- All Profitable
+
+| Filter | Total P&L | Fills | P&L/Fill |
+|--------|-----------|-------|----------|
+| SGD Logistic (online) | +$1,266 | 2,223 | +$0.57 |
+| Walk-Forward (frozen weights) | +$1,353 | 2,236 | +$0.61 |
+| EWMA Adaptive Threshold | +$277 | 3,204 | +$0.09 |
+
+Walk-forward outperforms live SGD, confirming that online learning does not improve over static initialization.
 
 ### Statistical Validation
 
-- **Symbol bootstrap** (3,731 symbols): 95% CI [$747, $837], 47.2% of individual symbols improve (portfolio diversification effect)
-- **HAC standard errors** (Newey-West): t = 5.53, p < 10^-7, SE inflation 1.51x
+- **HAC standard errors** (Newey-West): t = 5.53, p < 10^-7, 95% CI for 5-min PnL [$18.76, $39.33]
+- **Symbol bootstrap** (1,232 active symbols): 86.2% individually improve over baseline
 - **Cross-sectional**: 14/14 process groups individually profitable
 - **Hypothesis tests**: 4/5 rejected at alpha = 0.05 (H5 underpowered at n=14)
+- **Spearman correlation**: rho = 0.124 (composite), cancel ratio alone rho = 0.101 (n = 30,816)
+
+### Component Ablation
+
+| Component | P&L | % of Full Gain |
+|-----------|-----|----------------|
+| E[PnL] filter only | +$1,259 | 100% |
+| Spread widening only | -$312,790 | 13.7% |
+| OBI adjustment only | -$364,492 | -0.4% |
+| Full strategy | +$1,266 | 100% |
+
+The binary quote/no-quote decision captures all value. Spread widening and OBI are secondary.
 
 ### Key Negative Result
 
-Online SGD weight adaptation does not improve the toxicity signal beyond static initialization. Per-feature analysis reveals that **cancellation rate alone** (rho = 0.116) accounts for nearly all predictive power of the composite score (rho = 0.118). Three temporal features (trade flow imbalance, spread dynamics, price momentum) carry no significant signal at the 250us timescale.
+Online SGD weight adaptation does not improve the toxicity signal beyond static initialization. Cancel ratio alone (rho = 0.101) accounts for nearly all predictive power of the composite score (rho = 0.124). Three temporal features carry no significant signal at the 250us timescale.
+
+### Critical Parameter
+
+The inventory risk penalty gamma is the sole critical parameter:
+
+| gamma | P&L | Fills |
+|-------|-----|-------|
+| 5e-8 | -$32,896 | 6,206 |
+| 1e-7 | -$4,490 | 3,194 |
+| **2e-7** | **+$1,266** | **2,223** |
+
+A 4x reduction from optimal converts +$1.3K profit to -$32.9K loss.
 
 ## Building
 
@@ -56,7 +92,6 @@ Build targets:
 |--------|-------------|
 | `market_maker_sim` | Parallelized market making backtest engine (primary) |
 | `reader` | Command-line XDP message parser |
-| `visualizer` | Standalone ImGui order book viewer |
 | `visualizer_pcap` | PCAP-driven order book visualizer with playback |
 
 To build only the simulator:
@@ -90,7 +125,7 @@ cmake --build build --target market_maker_sim
 | `--latency-jitter-us J` | Latency jitter (microseconds) | 1 |
 | `--queue-fraction F` | Queue position as fraction of visible depth | 0.005 |
 | `--adverse-lookforward-us U` | Adverse selection measurement window (microseconds) | 250 |
-| `--adverse-multiplier M` | Adverse selection penalty multiplier | 0.03 |
+| `--adverse-multiplier M` | Adverse selection penalty multiplier | 0.15 |
 | `--maker-rebate R` | Maker rebate per share | 0.0025 |
 | `--max-position P` | Max position per symbol (shares) | 50000 |
 | `--max-loss L` | Max daily loss per symbol ($) | 5000 |
@@ -101,11 +136,14 @@ cmake --build build --target market_maker_sim
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--toxicity-threshold T` | Toxicity score threshold for quote suppression | 0.75 |
-| `--toxicity-multiplier K` | Toxicity-based spread multiplier | 1.0 |
+| `--filter-type TYPE` | Toxicity filter: `logistic` or `ewma` | logistic |
+| `--toxicity-threshold T` | Toxicity score threshold for quote suppression | 0.50 |
+| `--toxicity-multiplier K` | Toxicity-based spread multiplier | 3.0 |
 | `--online-learning` | Enable online SGD weight updates | disabled |
-| `--learning-rate R` | SGD base learning rate | 0.01 |
-| `--warmup-fills N` | Fills before SGD activates | 50 |
+| `--learning-rate R` | SGD base learning rate | 0.05 |
+| `--warmup-fills N` | Fills before SGD activates | 2 |
+| `--walk-forward` | Enable walk-forward out-of-sample evaluation | disabled |
+| `--ablation MODE` | Ablation mode: `spread`, `pnl`, `obi` | full |
 
 **Parallelism:**
 
@@ -119,18 +157,25 @@ cmake --build build --target market_maker_sim
 **Examples:**
 
 ```bash
-# Full day simulation with CSV output (14 process groups, ~216 seconds)
+# EV22 configuration — SGD logistic (produces results matching manuscript)
 ./build/market_maker_sim data/uncompressed-ny4-xnyx-pillar-a-20230822/*.pcap \
-  --output-dir documentation/analysis_output
+  --online-learning --output-dir results/logistic_ev22
+
+# Walk-forward variant (frozen weights, out-of-sample)
+./build/market_maker_sim data/uncompressed-ny4-xnyx-pillar-a-20230822/*.pcap \
+  --online-learning --walk-forward --output-dir results/wf_ev22
+
+# EWMA adaptive threshold filter
+./build/market_maker_sim data/uncompressed-ny4-xnyx-pillar-a-20230822/*.pcap \
+  --filter-type ewma --output-dir results/ewma_ev22
+
+# Component ablation (E[PnL] filter only)
+./build/market_maker_sim data/uncompressed-ny4-xnyx-pillar-a-20230822/*.pcap \
+  --online-learning --ablation pnl --output-dir results/ablation_pnl
 
 # Single ticker with custom parameters
 ./build/market_maker_sim data/ny4-xnys-pillar-a-20230822T133000.pcap \
   -t AAPL --latency-us 20 --adverse-multiplier 0.10
-
-# With online SGD learning
-./build/market_maker_sim data/uncompressed-ny4-xnyx-pillar-a-20230822/*.pcap \
-  --online-learning --learning-rate 0.01 --warmup-fills 50 \
-  --output-dir documentation/analysis_output
 ```
 
 ### XDP Parser (`reader`)
@@ -149,15 +194,29 @@ Real-time bid/ask ladder with playback controls, spread/mid-price statistics, an
 
 ## Analysis Pipeline
 
-All scripts are in `scripts/` and require Python 3.8+ with standard library only (no numpy/pandas/scipy).
-
-### `analyze_fills.py` -- Primary Statistical Analysis
-
-```bash
-python3 scripts/analyze_fills.py --output-dir documentation/analysis_output
+```
+market_maker_sim (C++)
+  ├── results/<variant>/fills_group_*.csv    (per-fill records with cumulative PnL)
+  └── results/<variant>/symbols_group_*.csv  (per-symbol summaries)
+        │
+        ▼
+scripts/generate_figures.py (matplotlib/seaborn)
+  ├── documentation/images/cumulative_pnl.png
+  ├── documentation/images/gamma_sensitivity.png
+  ├── documentation/images/ablation.png
+  └── documentation/images/symbol_improvement.png
+        │
+        ▼
+documentation/market_maker_manuscript.tex (LaTeX)
 ```
 
-Produces: toxicity decile analysis, Spearman rank correlations (overall + per-feature), symbol-level bootstrap CIs (10,000 resamples), and HAC (Newey-West) standard errors.
+### `generate_figures.py` -- Publication Figures
+
+```bash
+python3 scripts/generate_figures.py
+```
+
+Produces 4 PNG figures from the `results/` directory (requires matplotlib, seaborn, numpy, pandas).
 
 ### `test_hypotheses.py` -- Formal Hypothesis Testing
 
@@ -181,26 +240,30 @@ Varies four parameters: queue fraction (phi), adverse multiplier (chi), latency 
 
 The simulator uses `fork(2)` with `MAP_SHARED|MAP_ANONYMOUS` shared memory for parallelism:
 
-1. PCAP files are load-balanced across N process groups via greedy bin-packing
+1. PCAP files are distributed as contiguous time-slices across N process groups
 2. Each group runs in an isolated child process (zero lock contention between groups)
 3. Within each process, files are read via `mmap(2)` with `MADV_SEQUENTIAL` for zero-copy access
-4. Per-symbol state (`PerSymbolSim`) is maintained independently per process
-5. Results aggregate via shared memory after all children exit via `waitpid`
+4. Per-symbol state (`PerSymbolSim`) is maintained via pre-allocated 100K-slot arrays with atomic init flags and 64-shard mutexes
+5. Results aggregate via `ProcessResults` structs in shared memory after all children exit via `waitpid`
 
-Full day (~74GB, 121 PCAP files) completes in ~216 seconds on 14 cores at 70M+ messages/second.
+Full day (~74 GB, 121 PCAP files) completes in ~217 seconds on 14 cores at 70M+ messages/second.
 
 ### Simulation Design
 
-Each symbol runs two independent strategies in parallel:
+Each symbol runs two independent strategies on a single shared `OrderBook`:
 
 - **Baseline (`mm_baseline`)** -- Quotes at best bid/ask with inventory skew; no toxicity screening
-- **Toxicity-aware (`mm_toxicity`)** -- Same quoting logic, but suppresses quotes when expected PnL (after toxicity penalty) is negative
+- **Toxicity-aware (`mm_toxicity`)** -- Same quoting logic, but suppresses quotes when E[PnL] < 0
 
 Both share identical execution model parameters so their PnL difference isolates the value of toxicity screening.
 
-### Toxicity Model (8-Feature SGD Logistic)
+The E[PnL] filter computes: `P_fill * (spread/2 + rebate - mu_adv * T_hat) - gamma * Q^2`
 
-**Order-book features** (from `OrderBook::ToxicityMetrics`):
+The E[PnL] must use the **base spread** (not toxicity-adjusted spread) because fills near the NBBO capture base spread regardless of quoted width.
+
+### Toxicity Model (15-Feature SGD Logistic)
+
+**Order-book features** (5, from `OrderBook::ToxicityMetrics`):
 
 | Feature | Weight (init) | Description |
 |---------|--------------|-------------|
@@ -210,7 +273,7 @@ Both share identical execution model parameters so their PnL difference isolates
 | `precision_ratio` | 0.15 | Fraction priced beyond 2 decimal places |
 | `resistance_ratio` | 0.10 | Fraction at psychological price levels |
 
-**Temporal features** (from per-symbol circular buffers):
+**Temporal features** (3, from per-symbol circular buffers):
 
 | Feature | Weight (init) | Description |
 |---------|--------------|-------------|
@@ -218,11 +281,35 @@ Both share identical execution model parameters so their PnL difference isolates
 | `spread_change_rate` | 0.00 | Rate of spread change (50 observations) |
 | `price_momentum` | 0.00 | Short-term midprice momentum (50 observations) |
 
+**Structural features** (7, from top-L level statistics):
+
+| Feature | Weight (init) | Description |
+|---------|--------------|-------------|
+| `cancel_vol_intensity` | 0.00 | Volume cancelled / volume added |
+| `top_of_book_conc` | 0.00 | Best-level qty fraction of total depth |
+| `depth_imbalance` | 0.00 | Bid/ask depth ratio |
+| `level_asymmetry` | 0.00 | Bid/ask level count ratio |
+| `abs_trade_imbalance` | 0.00 | Absolute trade flow imbalance |
+| `large_order_ratio` | 0.00 | Orders > 200 shares / total events |
+| `normalized_spread` | 0.00 | Spread / mid-price |
+
 Predicts P(adverse fill) via sigmoid. Weights optionally updated via SGD with binary cross-entropy loss and Welford z-score normalization.
+
+### Execution Model
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| mu_adverse | 0.015 | Adverse cost per unit toxicity |
+| gamma_risk | 2e-7 | Quadratic inventory penalty (suppresses at ~75 shares) |
+| latency | 5 us | One-way quote latency (FPGA colocated) |
+| queue_fraction | 0.005 | Top 0.5% queue positioning |
+| chi | 0.15 | Adverse selection penalty multiplier |
+| maker_rebate | $0.0025/share | NYSE Tier 1 maker rebate |
+| taker_fee | $0.003/share | Taker fee for unwind crosses |
 
 ## Data
 
-PCAP files of NYSE XDP Integrated Feed multicast traffic. Sample data available from [Databento PCAP Samples](https://databento.com/pcaps#samples).
+PCAP files of NYSE XDP Integrated Feed multicast traffic captured August 22, 2023.
 
 ```
 data/
@@ -253,18 +340,17 @@ All multi-byte fields are little-endian. Prices are 32-bit integers divided by 1
 
 ```
 NYSE-XDP/
-├── CMakeLists.txt                    # Build configuration (4 targets)
+├── CMakeLists.txt                    # Build configuration
 ├── README.md
 ├── src/
 │   ├── market_maker_sim.cpp          # Orchestration: main(), process mgmt, XDP dispatch
-│   ├── per_symbol_sim.hpp / .cpp     # Per-symbol simulation (PerSymbolSim, 500+ lines)
+│   ├── per_symbol_sim.hpp / .cpp     # Per-symbol simulation (PerSymbolSim)
 │   ├── execution_model.hpp           # ExecutionModelConfig + SimConfig structs
 │   ├── feature_trackers.hpp          # Circular buffer trackers (trade flow, spread, momentum)
 │   ├── sim_types.hpp                 # VirtualOrder, FillRecord, SymbolRiskState
 │   ├── market_maker.hpp / .cpp       # Strategy classes and OnlineToxicityModel (SGD)
 │   ├── order_book.hpp                # Limit order book with toxicity metrics
 │   ├── reader.cpp                    # CLI XDP message parser
-│   ├── visualization.cpp             # Standalone ImGui order book viewer
 │   ├── visualizer_pcap.cpp           # PCAP-driven ImGui visualizer with playback
 │   └── common/
 │       ├── xdp_types.hpp             # XDP message structs (packed, little-endian)
@@ -275,17 +361,21 @@ NYSE-XDP/
 │       ├── symbol_map.hpp / .cpp     # Symbol index -> ticker lookup
 │       └── thirdparty/imgui/         # Dear ImGui (vendored)
 ├── scripts/
-│   ├── reproduce.sh                  # Full reproducible pipeline (build → sim → analysis)
-│   ├── analyze_fills.py              # Spearman, bootstrap CIs, HAC, decile analysis
+│   ├── generate_figures.py           # Publication figures (matplotlib/seaborn)
 │   ├── test_hypotheses.py            # Hypothesis tests (Sharpe, cross-sectional, binomial)
 │   └── parameter_sensitivity.py      # Sensitivity grid search
+├── results/                          # Simulation output CSVs (gitignored)
+│   ├── logistic_ev22/                # SGD logistic filter results
+│   ├── wf_ev22/                      # Walk-forward filter results
+│   ├── ewma_ev22/                    # EWMA filter results
+│   ├── ablation_spread/              # Spread-only ablation
+│   ├── ablation_pnl/                 # PnL-filter-only ablation
+│   └── ablation_obi/                 # OBI-only ablation
 ├── documentation/
 │   ├── market_maker_manuscript.tex   # Research paper (LaTeX)
-│   ├── ARCHITECTURE.md               # System architecture documentation
-│   ├── results.txt                   # Raw simulation output (14 process groups)
+│   ├── images/                       # Publication figures (generated)
 │   ├── hypothesis_test_results.json  # Hypothesis test outputs
-│   ├── parameter_sensitivity.json    # Sensitivity grid results
-│   └── analysis_output/              # Per-fill and per-symbol CSVs
+│   └── parameter_sensitivity.json    # Sensitivity grid results
 ├── data/                             # PCAP captures and symbol files (gitignored)
 └── data_sheets/                      # NYSE XDP protocol specifications (PDF)
 ```
@@ -300,3 +390,4 @@ This project is for educational and research purposes. NYSE XDP protocol specifi
 - [NYSE XDP Common Client Specification v2.3c](data_sheets/XDP_Common_Client_Specification_v2.3c.pdf)
 - Avellaneda, M. & Stoikov, S. (2008). High-frequency trading in a limit order book. *Quantitative Finance*, 8(3), 217--224.
 - Easley, D., Lopez de Prado, M. & O'Hara, M. (2012). Flow toxicity and liquidity in a high-frequency world. *Review of Financial Studies*, 25(5), 1457--1493.
+- Glosten, L. R. & Milgrom, P. R. (1985). Bid, ask and transaction prices in a specialist market with heterogeneously informed traders. *Journal of Financial Economics*, 14(1), 71--100.

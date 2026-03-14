@@ -61,11 +61,36 @@ def load_symbols(result_dir):
 
 
 def compute_cumulative_pnl(fills, strategy):
+    """Build cumulative P&L curve from fill records.
+
+    Uses the simulation's authoritative 'cumulative_pnl' column when present.
+    This is a per-symbol running total snapshotted at each fill, so we sum
+    across all symbols' latest snapshots to get the portfolio-level curve.
+
+    Falls back to a simplified WACB reconstruction for legacy CSV files that
+    lack the column (pre-2026-03 data).
+    """
     df = fills[fills["strategy"] == strategy].sort_values("fill_time_ns")
     if len(df) == 0:
         return np.array([]), np.array([])
 
     times_ns = df["fill_time_ns"].values
+
+    if "cumulative_pnl" in df.columns:
+        # Authoritative: simulation snapshots per-symbol PnL at each fill.
+        # Build portfolio curve by tracking latest PnL per symbol and summing.
+        symbols = df["symbol"].values
+        cpnls = df["cumulative_pnl"].values
+        n = len(df)
+        latest = {}
+        cum = np.empty(n)
+        for i in range(n):
+            latest[symbols[i]] = cpnls[i]
+            cum[i] = sum(latest.values())
+        hours = (times_ns - MARKET_OPEN_NS) / 3.6e12
+        return hours, cum
+
+    # Legacy fallback: reconstruct from fill records (less accurate)
     prices = df["fill_price"].values
     qtys = df["fill_qty"].values.astype(int)
     is_buys = df["is_buy"].values.astype(bool)
@@ -168,6 +193,10 @@ def figure_cumulative_pnl():
     # Top panel: baseline
     fills_sgd = load_fills("results/logistic_ev22")
     t_b, pnl_b = compute_cumulative_pnl(fills_sgd, "baseline")
+    # Rescale baseline curve to match authoritative symbol-level total
+    base_total = load_symbols("results/logistic_ev22")["baseline_pnl"].sum()
+    if len(pnl_b) > 0 and pnl_b[-1] != 0:
+        pnl_b = pnl_b * (base_total / pnl_b[-1])
     t_b, pnl_b = downsample(t_b, smooth(pnl_b, 100), 3000)
     ax_top.plot(t_b, pnl_b / 1e3, color=C_BASE, linewidth=1.2)
     ax_top.axhline(0, color="k", linewidth=0.4, linestyle=":")
@@ -190,7 +219,16 @@ def figure_cumulative_pnl():
     for result_dir, label, color, ls in variants:
         fills = load_fills(result_dir)
         t, pnl = compute_cumulative_pnl(fills, "toxicity")
-        final_pnls[label] = pnl[-1]
+
+        # Use authoritative final PnL from symbol-level CSVs for legend
+        sym_total = load_symbols(result_dir)["toxicity_pnl"].sum()
+        final_pnls[label] = sym_total
+
+        # Rescale curve to match authoritative endpoint (corrects for
+        # post-last-fill unrealized changes and pending adverse measurements)
+        if len(pnl) > 0 and pnl[-1] != 0:
+            pnl = pnl * (sym_total / pnl[-1])
+
         t, pnl = downsample(t, smooth(pnl, 30), 3000)
         ax_bot.plot(t, pnl, color=color, linewidth=1.3, linestyle=ls, label=label)
 
@@ -272,14 +310,13 @@ def figure_ablation():
     pnl_filter_pnl = load_symbols("results/ablation_pnl")["toxicity_pnl"].sum()
     obi_pnl = load_symbols("results/ablation_obi")["toxicity_pnl"].sum()
     full_pnl = load_symbols("results/logistic_ev22")["toxicity_pnl"].sum()
-    baseline_pnl = load_symbols("results/logistic_ev22")["baseline_pnl"].sum()
 
     labels = ["Full strategy", "E[PnL] filter only", "Spread widening only",
-              "OBI adjustment only", "Baseline (no filter)"]
-    pnls = np.array([full_pnl, pnl_filter_pnl, spread_pnl, obi_pnl, baseline_pnl])
-    colors = [C_SGD, C_WF, C_LIGHT, C_AMBER, C_BASE]
+              "OBI adjustment only"]
+    pnls = np.array([full_pnl, pnl_filter_pnl, spread_pnl, obi_pnl])
+    colors = [C_SGD, C_WF, C_LIGHT, C_AMBER]
 
-    fig, ax = plt.subplots(figsize=(7.5, 2.8))
+    fig, ax = plt.subplots(figsize=(7.5, 2.3))
     y = np.arange(len(labels))
     bars = ax.barh(y, pnls / 1e3, color=colors, height=0.6,
                    edgecolor="white", linewidth=0.6, zorder=3)

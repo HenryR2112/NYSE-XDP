@@ -30,6 +30,7 @@ struct FillRecord {
   double toxicity_at_fill = 0.0;  // Toxicity score at time of fill
   bool adverse_measured = false;
   double adverse_pnl = 0.0;
+  double cumulative_pnl = 0.0;    // Strategy PnL snapshot at fill time (realized + unrealized + adverse)
   ToxicityFeatureVector features;  // Per-fill feature vector for online learning
 };
 

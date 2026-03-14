@@ -957,7 +957,7 @@ void process_file_group(const std::vector<std::string>& files,
       if (fout.is_open()) {
         const char* filter_type_str = (g_config.filter_type == FilterType::EWMA) ? "ewma" : "logistic";
         fout << "group,symbol,ticker,strategy,filter_type,fill_time_ns,fill_price,fill_qty,is_buy,"
-             << "mid_price_at_fill,toxicity_at_fill,adverse_measured,adverse_pnl,"
+             << "mid_price_at_fill,toxicity_at_fill,adverse_measured,adverse_pnl,cumulative_pnl,"
              << "cancel_ratio,ping_ratio,odd_lot_ratio,precision_ratio,resistance_ratio,"
              << "trade_flow_imbalance,spread_change_rate,price_momentum,"
              << "cancel_vol_intensity,top_of_book_conc,depth_imbalance,level_asymmetry,"
@@ -975,7 +975,7 @@ void process_file_group(const std::vector<std::string>& files,
                  << fill.fill_price << ',' << fill.fill_qty << ','
                  << (fill.is_buy ? 1 : 0) << ',' << fill.mid_price_at_fill << ','
                  << fill.toxicity_at_fill << ',' << (fill.adverse_measured ? 1 : 0)
-                 << ',' << fill.adverse_pnl;
+                 << ',' << fill.adverse_pnl << ',' << fill.cumulative_pnl;
             for (int fi = 0; fi < N_TOXICITY_FEATURES; fi++) {
               fout << ',' << fill.features.features[fi];
             }

@@ -1,61 +1,83 @@
 {
-  "generated": "2026-02-20",
-  "git_hash": "cd452982acaa241e89dd81df5e9ad468dd33c191",
-  "pipeline": "scripts/reproduce.sh",
+  "generated": "2026-03-14",
+  "configuration": "EV22",
+  "dataset": "NYSE XDP Integrated Feed, August 22, 2023 (74 GB, 121 PCAP files)",
   "claims": {
     "baseline_total_pnl": {
-      "value": -16342.28,
-      "source": "documentation/hypothesis_test_results.json",
-      "field": "extras.Baseline Total PnL"
+      "value": -363134.48,
+      "source": "results/logistic_ev22/symbols_group_*.csv",
+      "field": "sum(baseline_pnl)"
     },
     "toxicity_total_pnl": {
-      "value": 791.71,
-      "source": "documentation/hypothesis_test_results.json",
-      "field": "extras.Toxicity Total PnL"
+      "value": 1265.68,
+      "source": "results/logistic_ev22/symbols_group_*.csv",
+      "field": "sum(toxicity_pnl)"
     },
     "pnl_improvement": {
-      "value": 17133.99,
+      "value": 364400.16,
       "source": "computed: toxicity - baseline"
     },
-    "spearman_rho": {
-      "value": 0.118,
-      "source": "documentation/analysis_output/advanced_analysis.json",
-      "field": "spearman_correlation.spearman_rho"
+    "baseline_fills": {
+      "value": 31390,
+      "source": "results/logistic_ev22/fills_group_*.csv"
     },
-    "bootstrap_ci": {
-      "value": [747, 837],
-      "source": "documentation/analysis_output/advanced_analysis.json",
-      "field": "symbol_bootstrap.bootstrap_ci_95_toxicity_pnl"
+    "toxicity_fills": {
+      "value": 2223,
+      "source": "results/logistic_ev22/fills_group_*.csv"
+    },
+    "wf_toxicity_pnl": {
+      "value": 1353.32,
+      "source": "results/wf_ev22/symbols_group_*.csv"
+    },
+    "ewma_toxicity_pnl": {
+      "value": 276.92,
+      "source": "results/ewma_ev22/symbols_group_*.csv"
+    },
+    "spearman_rho_composite": {
+      "value": 0.124,
+      "source": "manuscript Table 5, baseline fills n=30,816"
+    },
+    "spearman_rho_cancel_ratio": {
+      "value": 0.101,
+      "source": "manuscript Table 6, baseline fills n=30,816"
     },
     "hac_t_statistic": {
       "value": 5.53,
-      "source": "documentation/analysis_output/advanced_analysis.json",
-      "field": "hac_standard_errors.t_statistic_nw"
+      "source": "82 five-minute bins, Newey-West with Bartlett kernel"
     },
-    "sharpe_toxicity": {
-      "value": 2.031,
-      "source": "documentation/hypothesis_test_results.json",
-      "field": "tests.Sharpe Improvement.sharpe_toxicity"
-    },
-    "sharpe_baseline": {
-      "value": -1.454,
-      "source": "documentation/hypothesis_test_results.json",
-      "field": "tests.Sharpe Improvement.sharpe_baseline"
-    },
-    "adverse_reduction": {
-      "value": "71.9%",
-      "source": "documentation/hypothesis_test_results.json",
-      "field": "tests.Adverse Selection Reduction.reduction_pct"
+    "adverse_selection_reduction": {
+      "value": "91.8%",
+      "source": "($5,306 - $435) / $5,306"
     },
     "inventory_variance_reduction": {
       "value": "85.6%",
-      "source": "documentation/hypothesis_test_results.json",
-      "field": "tests.Inventory Variance Reduction.reduction_pct"
+      "source": "(63,641 - 9,137) / 63,641"
     },
-    "cancel_ratio_rho": {
-      "value": 0.116,
-      "source": "documentation/analysis_output/advanced_analysis.json",
-      "field": "per_feature_correlation.features[0].spearman_rho"
+    "symbols_improved_fraction": {
+      "value": "86.2%",
+      "source": "1,232 active symbols with fills"
     }
+  },
+  "key_parameters": {
+    "mu_adverse": 0.015,
+    "gamma_risk": 2e-7,
+    "chi": 0.15,
+    "phi": 0.005,
+    "latency_us": 5,
+    "toxicity_spread_multiplier": 3.0,
+    "toxicity_threshold": 0.50,
+    "epsilon_min": 0.0,
+    "maker_rebate": 0.0025,
+    "taker_fee": 0.003
+  },
+  "filter_variants": {
+    "logistic_ev22": "SGD logistic, 15 features, online learning",
+    "wf_ev22": "Walk-forward, 30-min windows, frozen prior-window weights",
+    "ewma_ev22": "EWMA adaptive threshold, cancel ratio only, alpha=0.05"
+  },
+  "ablation_variants": {
+    "ablation_spread": "Spread widening only (kappa), no PnL filter, no OBI",
+    "ablation_pnl": "PnL filter only (epsilon_min), fixed spread, no OBI",
+    "ablation_obi": "OBI adjustment only, fixed spread, no PnL filter"
   }
 }
